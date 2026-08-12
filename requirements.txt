@@ -1,0 +1,3 @@
+openai==2.48.0
+pymupdf4llm==1.28.0
+pydantic==2.13.4

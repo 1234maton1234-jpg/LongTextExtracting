@@ -1,0 +1,32 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- 缓存 / 测试缓存 ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- IDE ---
+.idea/
+.vscode/
+*.swp
+
+# --- Claude Code 本地设置（不共享） ---
+.claude/
+
+# --- 密钥（本地环境变量，勿提交） ---
+.env
+.env.local
+*.env
+
+# --- 运行产物（每次运行都会变，由脚本重新生成） ---
+outputs/
+
+# --- 操作系统 ---
+.DS_Store
+Thumbs.db
