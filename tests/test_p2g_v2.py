@@ -2245,6 +2245,97 @@ class RequestRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("source_quote 尽量简短", system_prompt)
         await self._cleanup_extract(pipeline)
 
+    async def _make_reduce_pipeline(self, scripted_responses):
+        """Minimal pipeline wired for the reduce stages (section + group): adds
+        cache/flash-model/reduce budget so the first-call kwargs are visible."""
+        pipeline, completions = await self._make_recovery_pipeline(scripted_responses)
+        pipeline.flash_model = "flash"
+        pipeline.pro_model = None
+        pipeline.reduce_max_output_tokens = 2200
+        pipeline.group_fallbacks = 0
+        pipeline._document_fact_index = {}
+        self._reduce_dir = tempfile.mkdtemp()
+        pipeline.cache = ResultCache(Path(self._reduce_dir) / "cache.sqlite3")
+        return pipeline, completions
+
+    async def _cleanup_reduce(self, pipeline) -> None:
+        pipeline.cache.close()
+        await self._cleanup_usage(pipeline)
+        shutil.rmtree(self._reduce_dir, ignore_errors=True)
+
+    async def test_synthesize_section_initial_call_thinks_off(self):
+        # Section reduce is mechanical summarization with hard output caps; the
+        # first call must not burn the 2200 budget on reasoning_content.
+        valid = {
+            "title": "方法",
+            "summary": "摘要",
+            "core_concepts": ["概念"],
+            "key_findings": ["结论"],
+            "source_pages": [1],
+        }
+        pipeline, completions = await self._make_reduce_pipeline(
+            [("stop", json.dumps(valid, ensure_ascii=False))]
+        )
+        section = HeadingNode(
+            id="s1", title="方法", level=2,
+            page_start=1, page_end=1, subtree_page_end=1,
+        )
+        extraction = ChunkExtraction.model_validate(
+            {
+                "summary": "摘要",
+                "facts": [
+                    {
+                        "concept": "概念",
+                        "statement": "事实",
+                        "kind": "result",
+                        "source_quote": "原文",
+                        "page": 1,
+                        "confidence": 0.9,
+                        "grounded": True,
+                    }
+                ],
+                "new_concepts": [],
+            }
+        )
+
+        result = await pipeline.synthesize_section(section, [extraction])
+
+        self.assertEqual(result.summary, "摘要")
+        self.assertEqual(completions.calls, 1)
+        first = completions.kwargs[0]
+        self.assertEqual(first["reasoning_effort"], "none")
+        self.assertEqual(first["max_tokens"], pipeline.reduce_max_output_tokens)
+        await self._cleanup_reduce(pipeline)
+
+    async def test_reduce_group_initial_call_thinks_off(self):
+        # Document group reduce merged 81 calls at 81% reasoning (42% truncation)
+        # on the v224 run; the first call must run with reasoning_effort="none".
+        valid = {
+            "summary": "组摘要",
+            "concepts": ["概念"],
+            "findings": ["结论"],
+            "numeric_claims": [],
+            "limitations": [],
+            "future_work": [],
+            "contradictions": [],
+            "source_fact_ids": ["f1"],
+            "source_sections": [],
+            "source_pages": [],
+        }
+        pipeline, completions = await self._make_reduce_pipeline(
+            [("stop", json.dumps(valid, ensure_ascii=False))]
+        )
+        items = [{"fact_id": "f1", "section_id": "s1", "concept": "概念", "statement": "事实"}]
+
+        result = await pipeline._reduce_group(items, 0, 0)
+
+        self.assertEqual(result.summary, "组摘要")
+        self.assertEqual(completions.calls, 1)
+        first = completions.kwargs[0]
+        self.assertEqual(first["reasoning_effort"], "none")
+        self.assertEqual(first["max_tokens"], pipeline.reduce_max_output_tokens)
+        await self._cleanup_reduce(pipeline)
+
 
 if __name__ == "__main__":
     unittest.main()

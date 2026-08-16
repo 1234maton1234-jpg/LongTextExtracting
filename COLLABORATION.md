@@ -19,7 +19,7 @@
    Copy-Item .env.example .env
    ```
    编辑 `.env`，把 `DEEPSEEK_API_KEY` 改成**你自己的**（不要用别人的，不要提交）。
-5. 跑测试确认环境正常（101 个应全部通过）：
+5. 跑测试确认环境正常（103 个应全部通过）：
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\test.ps1
    ```

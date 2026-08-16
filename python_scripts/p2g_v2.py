@@ -39,8 +39,8 @@ PICTURE_TEXT_BLOCK_RE = re.compile(
 IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 MARK_TAG_RE = re.compile(r"</?mark\b[^>]*>", re.IGNORECASE)
 EXTRACTION_PROMPT_VERSION = "v2.9"
-REDUCE_PROMPT_VERSION = "v2.8"
-GROUP_PROMPT_VERSION = "v2.10"
+REDUCE_PROMPT_VERSION = "v2.9"
+GROUP_PROMPT_VERSION = "v2.11"
 DOCUMENT_PROMPT_VERSION = "v2.16"
 GLOBAL_QUESTIONS = [
     "文档的核心研究问题是什么？",
@@ -2826,6 +2826,7 @@ summary 和 key_findings 用中文概括；输入事实为英文时先翻译成�
             json.dumps({"title": section.title, "facts": compact}, ensure_ascii=False),
             response_model=SectionSynthesis,
             max_output_tokens=self.reduce_max_output_tokens,
+            reasoning_effort="none",
         )
         result = SectionSynthesis.model_validate(payload)
         self.cache.put(key, result.model_dump())
@@ -2869,6 +2870,7 @@ source_fact_ids 必须来自输入，只保留直接支持组摘要的最少证�
                 content,
                 response_model=GroupSynthesis,
                 max_output_tokens=self.reduce_max_output_tokens,
+                reasoning_effort="none",
             )
             result = GroupSynthesis.model_validate(payload)
         except RuntimeError:
