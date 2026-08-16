@@ -17,6 +17,7 @@ from p2g_v2 import (  # noqa: E402
     ConceptMemory,
     ResultCache,
     ChunkExtraction,
+    DocumentOverview,
     DocumentSynthesis,
     GLOBAL_QUESTIONS,
     Fact,
@@ -26,7 +27,9 @@ from p2g_v2 import (  # noqa: E402
     UsageTracker,
     PageMarkdown,
     _apply_answer_provenance,
+    _apply_document_title,
     _absorb_noise_nodes,
+    _candidate_document_title,
     _build_fact_index,
     _apply_grounding,
     _apply_group_provenance,
@@ -1163,6 +1166,102 @@ class UtilityTests(unittest.TestCase):
         self.assertIn("fact-limitation-conclusion", allowed)
         self.assertIn("fact-result-future", allowed)
 
+    def test_future_question_request_blocks_method_facts_with_future_markers(self):
+        # The hard kind gate must exclude method facts even when they carry future
+        # keywords or sit in a future-work section (the additive keyword +40
+        # section bonus used to lift them above the score>0 cutoff).
+        facts = [
+            {
+                "fact_id": "fact-method-future-section",
+                "statement": "未来的工作将扩展该方法的并行训练策略。",
+                "kind": "method",
+                "section_title": "6 Future Work",
+                "confidence": 1.0,
+            },
+            {
+                "fact_id": "fact-method-keywords",
+                "statement": "该方法的目标是改进推理性能，后续计划部署。",
+                "kind": "method",
+                "section_title": "3 Methods",
+                "confidence": 1.0,
+            },
+            {
+                "fact_id": "fact-limitation",
+                "statement": "当前方法在噪声环境下鲁棒性有限。",
+                "kind": "limitation",
+                "section_title": "5 Discussion",
+                "confidence": 1.0,
+            },
+            {
+                "fact_id": "fact-result",
+                "statement": "未来计划将智能体数量扩展到 1000。",
+                "kind": "result",
+                "section_title": "8 Conclusion",
+                "confidence": 1.0,
+            },
+        ]
+
+        _, allowed = build_question_request(GLOBAL_QUESTIONS[8], facts, [], max_tokens=600)
+
+        self.assertNotIn("fact-method-future-section", allowed)
+        self.assertNotIn("fact-method-keywords", allowed)
+        self.assertIn("fact-limitation", allowed)
+        self.assertIn("fact-result", allowed)
+
+    def test_future_question_request_fallback_when_no_limitation_or_result(self):
+        # The gate falls back to the soft scorer when the document has zero
+        # limitation/result facts, so such a run does not degrade into an empty
+        # catalog / "证据不足". The plain method fact still scores 0.
+        facts = [
+            {
+                "fact_id": "fact-method-future-section",
+                "statement": "未来的工作将扩展并行训练策略。",
+                "kind": "method",
+                "section_title": "6 Future Work",
+                "confidence": 1.0,
+            },
+            {
+                "fact_id": "fact-method-plain",
+                "statement": "方法采用 MFCC 特征。",
+                "kind": "method",
+                "section_title": "3 Methods",
+                "confidence": 1.0,
+            },
+        ]
+
+        _, allowed = build_question_request(GLOBAL_QUESTIONS[8], facts, [], max_tokens=600)
+
+        self.assertIn("fact-method-future-section", allowed)
+        self.assertNotIn("fact-method-plain", allowed)
+
+    def test_future_gate_tied_to_route_not_raw_text(self):
+        # The gate keys off the *resolved* route, not raw question text: a
+        # question that merely contains 未来/改进 but routes to the dataset
+        # branch must keep its own kind mix untouched.
+        facts = [
+            {
+                "fact_id": "fact-dataset",
+                "statement": "未来工作中计划使用 UrbanSound8K 数据集。",
+                "kind": "dataset",
+                "section_title": "3 Methods",
+                "confidence": 1.0,
+            },
+            {
+                "fact_id": "fact-method",
+                "statement": "方法采用 MFCC 特征。",
+                "kind": "method",
+                "section_title": "3 Methods",
+                "confidence": 1.0,
+            },
+        ]
+
+        _, allowed = build_question_request(
+            "未来工作中计划使用哪些数据集或材料？", facts, [], max_tokens=600
+        )
+
+        self.assertIn("fact-dataset", allowed)
+        self.assertNotIn("fact-method", allowed)
+
     def test_merge_table_headers_joins_two_row_header(self):
         # ``Claude`` / ``4.5-Opus`` becomes ``Claude 4.5-Opus`` and stays distinct
         # from ``Claude 4.5-Sonnet`` — the two Claude columns are NOT conflated.
@@ -1843,6 +1942,176 @@ class UsageTrackerTests(unittest.TestCase):
         self.assertIn("The player begins", parent.text)
 
 
+class DocumentTitleTests(unittest.TestCase):
+    def _node(self, node_id, title, level, parent, children=(), page=1):
+        node = HeadingNode(
+            id=node_id, title=title, level=level, page_start=page, page_end=page,
+            subtree_page_end=page, parent_id=parent, text="body",
+        )
+        node.children = list(children)
+        return node
+
+    def _overview(self, title):
+        return DocumentOverview(
+            title=title,
+            executive_summary="本文综述了 Agent AI 在多模态交互方向的研究进展。",
+            research_question="Agent AI 如何实现多模态交互？",
+            methods=[], datasets=[], metrics=[], key_findings=[],
+            limitations=[], future_work=[], contradictions=[],
+        )
+
+    def test_candidate_document_title_returns_paper_title(self):
+        title = self._node(
+            "title", "Agent AI: Surveying the Horizons of Multimodal Interaction", 1, "root"
+        )
+        abstract = self._node("abs", "Abstract", 2, "root")
+        intro = self._node("intro", "1 Introduction", 2, "root")
+        root = self._node("root", "Document", 0, None, [title, abstract, intro])
+
+        self.assertEqual(
+            _candidate_document_title(root),
+            "Agent AI: Surveying the Horizons of Multimodal Interaction",
+        )
+
+    def test_candidate_document_title_accepts_level2_title(self):
+        # A title at raw ## stays at L2 when _normalize_levels finds min_level==2
+        # (no shift) -- never require a specific level.
+        title = self._node("title", "Agentopia: A Study of Long-Horizon Behavior", 2, "root")
+        intro = self._node("intro", "3 Agentopia", 2, "root")
+        root = self._node("root", "Document", 0, None, [title, intro])
+
+        self.assertEqual(
+            _candidate_document_title(root),
+            "Agentopia: A Study of Long-Horizon Behavior",
+        )
+
+    def test_candidate_document_title_rejects_front_matter(self):
+        # _section_signature only catches Abstract/摘要 and numbered sections, so
+        # Introduction must be rejected by the front-matter blacklist.
+        abstract = self._node("abs", "Abstract", 1, "root")
+        intro = self._node("intro", "Introduction", 1, "root")
+        numbered = self._node("num", "1 Introduction", 1, "root")
+        root = self._node("root", "Document", 0, None, [abstract, intro, numbered])
+
+        self.assertIsNone(_candidate_document_title(root))
+
+    def test_candidate_document_title_skips_toc_and_back_matter(self):
+        toc = self._node("toc", "Contents", 1, "root")
+        title = self._node("title", "The Real Title", 1, "root")
+        refs = self._node("refs", "References", 1, "root")
+        root = self._node("root", "Document", 0, None, [toc, title, refs])
+
+        self.assertEqual(_candidate_document_title(root), "The Real Title")
+
+    def test_candidate_document_title_rejects_running_header(self):
+        header = self._node("hdr", "Discover Internet of Things", 1, "root")
+        root = self._node("root", "Document", 0, None, [header])
+
+        self.assertIsNone(_candidate_document_title(root))
+
+    def test_candidate_document_title_joins_split_title_lines(self):
+        # The Agent AI PDF lays the title out as two sibling heading nodes;
+        # the first line alone ("AGENT AI:") is truncated.
+        line1 = self._node("t1", "AGENT AI:", 1, "root")
+        line2 = self._node("t2", "SURVEYING THE HORIZONS OF MULTIMODAL INTERACTION", 1, "root")
+        abstract = self._node("abs", "Abstract", 2, "root")
+        root = self._node("root", "Document", 0, None, [line1, line2, abstract])
+
+        self.assertEqual(
+            _candidate_document_title(root),
+            "AGENT AI: SURVEYING THE HORIZONS OF MULTIMODAL INTERACTION",
+        )
+
+    def test_candidate_document_title_does_not_join_section_after_plain_title(self):
+        # No trailing colon -> never treat the next sibling as a continuation,
+        # otherwise "My Paper" would swallow a following unnumbered section.
+        title = self._node("title", "My Paper", 1, "root")
+        related = self._node("rel", "Related Work", 1, "root")
+        root = self._node("root", "Document", 0, None, [title, related])
+
+        self.assertEqual(_candidate_document_title(root), "My Paper")
+
+    def test_candidate_document_title_joins_then_stops_at_section(self):
+        # Joining continues past plausible title lines but stops at a numbered
+        # section (filtered by _section_signature).
+        line1 = self._node("t1", "Agent AI:", 1, "root")
+        line2 = self._node("t2", "Surveying the Horizons of Multimodal Interaction", 1, "root")
+        intro = self._node("intro", "1 Introduction", 2, "root")
+        root = self._node("root", "Document", 0, None, [line1, line2, intro])
+
+        self.assertEqual(
+            _candidate_document_title(root),
+            "Agent AI: Surveying the Horizons of Multimodal Interaction",
+        )
+
+    def test_candidate_document_title_does_not_join_across_pages(self):
+        line1 = self._node("t1", "Agent AI:", 1, "root", page=1)
+        line2 = self._node("t2", "Surveying the Horizons", 1, "root", page=2)
+        root = self._node("root", "Document", 0, None, [line1, line2])
+
+        self.assertEqual(_candidate_document_title(root), "Agent AI:")
+
+    def test_apply_document_title_overrides_hallucinated_title(self):
+        result = self._overview("多模态代理论坛")
+
+        _apply_document_title(result, "Agent AI: Surveying the Horizons of Multimodal Interaction")
+
+        self.assertEqual(result.title, "Agent AI: Surveying the Horizons of Multimodal Interaction")
+
+    def test_apply_document_title_keeps_verbatim_and_same_language_variant(self):
+        # English candidate with the verbatim English title, and a Chinese
+        # candidate with a same-language paraphrase: both share enough tokens and
+        # must be kept.
+        for candidate, kept in (
+            (
+                "Agent AI: Surveying the Horizons of Multimodal Interaction",
+                "Agent AI: Surveying the Horizons of Multimodal Interaction",
+            ),
+            ("面向多模态智能代理的综述", "多模态智能代理综述"),
+        ):
+            result = self._overview(kept)
+            _apply_document_title(result, candidate)
+            self.assertEqual(result.title, kept)
+
+    def test_apply_document_title_overrides_faithful_translation(self):
+        # A faithful Chinese translation of an English candidate scores ~0.2 token
+        # overlap and is overridden back to the original -- the intended behavior
+        # per the "title keeps its original language" decision.
+        result = self._overview("Agent AI：多模态交互方向综述")
+
+        _apply_document_title(result, "Agent AI: Surveying the Horizons of Multimodal Interaction")
+
+        self.assertEqual(result.title, "Agent AI: Surveying the Horizons of Multimodal Interaction")
+
+    def test_apply_document_title_overrides_truncated_prefix(self):
+        # The heading tree joins "AGENT AI:" + "SURVEYING..." into one candidate,
+        # but a model that echoes only the first line passes the old overlap>=0.5
+        # rule (answer tokens are a 100% subset of the candidate). The coverage
+        # rule must catch it and restore the full title.
+        result = self._overview("AGENT AI:")
+
+        _apply_document_title(result, "Agent AI: Surveying the Horizons of Multimodal Interaction")
+
+        self.assertEqual(result.title, "Agent AI: Surveying the Horizons of Multimodal Interaction")
+
+    def test_apply_document_title_skips_override_when_candidate_absent_from_summary(self):
+        # A byline/journal name the heading tree promoted to a heading passes the
+        # filters, but the model's content never mentions it -- the consistency
+        # check must refuse to force it.
+        result = self._overview("多模态代理论坛")
+
+        _apply_document_title(result, "John Doe, MIT")
+
+        self.assertEqual(result.title, "多模态代理论坛")
+
+    def test_fallback_document_overview_accepts_title(self):
+        overview = fallback_document_overview([], [], title="My Paper")
+        self.assertEqual(overview.title, "My Paper")
+
+        overview = fallback_document_overview([], [])
+        self.assertEqual(overview.title, "Document")
+
+
 class LevelNormalizationTests(unittest.TestCase):
     def _node(self, node_id, title, level, parent, children=(), page=1):
         node = HeadingNode(
@@ -2334,6 +2603,199 @@ class RequestRetryTests(unittest.IsolatedAsyncioTestCase):
         first = completions.kwargs[0]
         self.assertEqual(first["reasoning_effort"], "none")
         self.assertEqual(first["max_tokens"], pipeline.reduce_max_output_tokens)
+        await self._cleanup_reduce(pipeline)
+
+    async def test_synthesize_overview_injects_candidate_title_and_backstop(self):
+        overview_json = {
+            "title": "多模态代理论坛",
+            "executive_summary": "本文综述了 Agent AI 在多模态交互方向的研究进展，涵盖方法、基准与伦理讨论。",
+            "research_question": "Agent AI 如何通过生成式 AI 实现现实无关训练并推动 AGI 发展？",
+            "methods": ["KAT"],
+            "datasets": ["CuisineWorld"],
+            "metrics": ["准确率"],
+            "key_findings": ["基础模型在具身 AI 中性能有限"],
+            "limitations": ["音频整合不足"],
+            "future_work": ["多模态整合", "工具使用"],
+            "contradictions": [],
+        }
+        pipeline, completions = await self._make_reduce_pipeline(
+            [("stop", json.dumps(overview_json, ensure_ascii=False))]
+        )
+        pipeline.document_max_output_tokens = 3000
+        pipeline.document_title = "Agent AI: Surveying the Horizons of Multimodal Interaction"
+        document_request = {
+            "evidence": [],
+            "fact_catalog": [],
+            "deterministic_contradictions": [],
+            "questions": [],
+        }
+
+        result = await pipeline._synthesize_overview(document_request, [], [])
+
+        self.assertEqual(completions.calls, 1)
+        self.assertEqual(
+            result.title,
+            "Agent AI: Surveying the Horizons of Multimodal Interaction",
+        )
+        system = completions.kwargs[0]["messages"][0]["content"]
+        self.assertIn("candidate_title", system)
+        self.assertIn("衔接词", system)
+        self.assertIn("分点", system)
+        await self._cleanup_reduce(pipeline)
+
+    async def test_synthesize_overview_cached_reapplies_backstop(self):
+        overview_json = {
+            "title": "多模态代理论坛",
+            "executive_summary": "本文综述了 Agent AI 在多模态交互方向的研究进展。",
+            "research_question": "Agent AI 如何实现多模态交互？",
+            "methods": [],
+            "datasets": [],
+            "metrics": [],
+            "key_findings": [],
+            "limitations": [],
+            "future_work": [],
+            "contradictions": [],
+        }
+        pipeline, completions = await self._make_reduce_pipeline(
+            [("stop", json.dumps(overview_json, ensure_ascii=False))]
+        )
+        pipeline.document_max_output_tokens = 3000
+        pipeline.document_title = "Agent AI: Surveying the Horizons of Multimodal Interaction"
+        document_request = {
+            "evidence": [],
+            "fact_catalog": [],
+            "deterministic_contradictions": [],
+            "questions": [],
+        }
+
+        first = await pipeline._synthesize_overview(document_request, [], [])
+        second = await pipeline._synthesize_overview(document_request, [], [])
+
+        self.assertEqual(completions.calls, 1)  # second call served from cache
+        self.assertEqual(first.title, pipeline.document_title)
+        self.assertEqual(second.title, pipeline.document_title)
+        await self._cleanup_reduce(pipeline)
+
+    def _group_response(self):
+        return ("stop", json.dumps(
+            {
+                "summary": "组摘要",
+                "concepts": ["概念"],
+                "findings": ["结论"],
+                "numeric_claims": [],
+                "limitations": [],
+                "future_work": [],
+                "contradictions": [],
+                "source_fact_ids": [],
+                "source_sections": [],
+                "source_pages": [],
+            },
+            ensure_ascii=False,
+        ))
+
+    def _overview_response(self, title):
+        return ("stop", json.dumps(
+            {
+                "title": title,
+                "executive_summary": "本文综述了 Agent AI 系统在多模态交互方向的研究进展。",
+                "research_question": "Agent AI 系统如何实现多模态交互？",
+                "methods": [],
+                "datasets": [],
+                "metrics": [],
+                "key_findings": [],
+                "limitations": [],
+                "future_work": [],
+                "contradictions": [],
+            },
+            ensure_ascii=False,
+        ))
+
+    def _answer_response(self):
+        return ("stop", json.dumps(
+            {
+                "question": "问题",
+                "answer": "答案",
+                "source_fact_ids": [],
+                "source_sections": [],
+                "source_pages": [],
+                "confidence": 0.8,
+            },
+            ensure_ascii=False,
+        ))
+
+    def _section_results(self, title):
+        return [
+            {
+                "section": {
+                    "id": "s1",
+                    "title": title,
+                    "level": 1,
+                    "page_start": 1,
+                    "page_end": 1,
+                    "subtree_page_end": 1,
+                    "parent_id": None,
+                    "children": [],
+                },
+                "extractions": [
+                    {
+                        "summary": "摘要",
+                        "facts": [
+                            {
+                                "concept": "Agent AI",
+                                "statement": "Agent AI 系统能够感知并在不同领域行动。",
+                                "kind": "result",
+                                "source_quote": "原文",
+                                "page": 1,
+                                "confidence": 0.9,
+                                "grounded": True,
+                            }
+                        ],
+                        "new_concepts": [],
+                    }
+                ],
+                "table_facts": [],
+                "detected_facts": [],
+                "numeric_contradictions": [],
+                "synthesis": {
+                    "summary": "摘要",
+                    "core_concepts": ["概念"],
+                    "key_findings": ["结论"],
+                },
+            }
+        ]
+
+    async def test_synthesize_document_bundle_reapplies_title_backstop(self):
+        # synthesize_document short-circuits on the document_bundle cache before
+        # the overview stage, so a truncated title in the cached bundle must be
+        # corrected at read time, and the bundle key must fold the candidate so a
+        # changed candidate forces a fresh bundle instead of returning a stale title.
+        full_title = "Agent AI: Surveying the Horizons of Multimodal Interaction"
+        # 1 group reduce + 1 overview (truncated prefix) + 10 global answers, then
+        # a fresh overview after the candidate changes. The third call reuses the
+        # same sections, so reduce and all 10 answers are cache hits; only the
+        # document_bundle (whose key folds the candidate) misses.
+        scripted = [self._group_response(), self._overview_response("AGENT AI:")]
+        scripted += [self._answer_response() for _ in range(10)]
+        scripted += [self._overview_response("AGENT AI:")]
+        pipeline, completions = await self._make_reduce_pipeline(scripted)
+        pipeline.document_max_output_tokens = 3000
+        pipeline.document_title = full_title
+        section_results = self._section_results(full_title)
+
+        first = await pipeline.synthesize_document(section_results)
+        self.assertEqual(completions.calls, 12)  # 1 reduce + 1 overview + 10 answers
+        self.assertEqual(first.title, full_title)  # fresh-path backstop restores the prefix
+
+        second = await pipeline.synthesize_document(section_results)
+        self.assertEqual(completions.calls, 12)  # reduce + bundle cache hits, no new API calls
+        self.assertEqual(second.title, full_title)  # bundle-hit path re-applies the backstop
+
+        # A changed candidate must invalidate the bundle cache key.
+        other_title = "Agent AI: A Revised Survey"
+        pipeline.document_title = other_title
+        third = await pipeline.synthesize_document(section_results)
+        self.assertEqual(completions.calls, 13)  # +1 fresh overview; reduce + answers still cached
+        self.assertEqual(third.title, other_title)
         await self._cleanup_reduce(pipeline)
 
 

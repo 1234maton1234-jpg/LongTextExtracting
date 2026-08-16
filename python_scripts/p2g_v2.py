@@ -41,7 +41,7 @@ MARK_TAG_RE = re.compile(r"</?mark\b[^>]*>", re.IGNORECASE)
 EXTRACTION_PROMPT_VERSION = "v2.9"
 REDUCE_PROMPT_VERSION = "v2.9"
 GROUP_PROMPT_VERSION = "v2.11"
-DOCUMENT_PROMPT_VERSION = "v2.16"
+DOCUMENT_PROMPT_VERSION = "v2.17"
 GLOBAL_QUESTIONS = [
     "文档的核心研究问题是什么？",
     "文档使用了哪些数据集或材料？",
@@ -501,6 +501,95 @@ def _section_signature(title: str) -> str | None:
     normalized = re.sub(r"[^a-z\u3400-\u9fff]+", "", cleaned.lower())
     aliases = {"abstract": "abstract", "摘要": "abstract"}
     return aliases.get(normalized)
+
+
+# Unnumbered level-1/2 headings that are document structure, not the document
+# title. _section_signature only catches numbered sections and Abstract/摘要, and
+# is_back_matter/_is_toc_section do not catch Introduction/References etc., so a
+# title candidate must also clear this blacklist.
+_FRONT_MATTER_TITLES = {
+    "abstract",
+    "introduction",
+    "conclusion",
+    "conclusions",
+    "references",
+    "bibliography",
+    "contents",
+    "acknowledgements",
+    "acknowledgments",
+    "keywords",
+    "key words",
+    "摘要",
+    "引言",
+    "绪论",
+    "前言",
+    "结论",
+    "参考文献",
+    "目录",
+    "关键词",
+    "致谢",
+}
+
+
+def _candidate_document_title(root: HeadingNode) -> str | None:
+    """Deterministic document-title candidate from the heading tree.
+
+    The paper title usually survives preprocessing as a top-level heading that is
+    not a numbered section (``_normalize_levels`` re-bases numbered sections to
+    L2 but leaves unnumbered wrappers like the title at their original level, so
+    the title may be L1 *or* L2 -- never require a specific level). Take the
+    first root child that is not Abstract/numbered/back-matter/TOC/front-matter
+    and passes ``is_probable_heading`` (running headers, URLs, captions and
+    generic labels are rejected there). Returns None when no clean title exists;
+    the overview model then falls back to its own summary.
+    """
+    for idx, node in enumerate(root.children):
+        if node.page_start > 2:  # a real title sits on page 1
+            continue
+        title = _plain_heading(node.title)
+        if not title:
+            continue
+        if _section_signature(node.title) is not None:
+            continue
+        if is_back_matter(node.title) or _is_toc_section(node.title):
+            continue
+        if title.lower() in _FRONT_MATTER_TITLES:
+            continue
+        if not is_probable_heading(title):
+            continue
+        return _join_title_lines(root.children, idx, title)
+    return None
+
+
+def _join_title_lines(children: list[HeadingNode], idx: int, title: str) -> str:
+    """Re-join a multi-line paper title that preprocessing split into siblings.
+
+    The title block is laid out as separate heading nodes ("Agent AI:\nSurveying
+    the Horizons of Multimodal Interaction" becomes two root children), so the
+    first plausible line alone is truncated. A trailing colon is the dominant
+    title-split signal: while the accumulated title ends with ':' and the next
+    sibling is another plausible title line on the same page (passes the same
+    filters as the first line), append it. This stops at Abstract/Introduction/
+    numbered sections because they fail the filters, and never glues a following
+    section onto a colon-less title like "My Paper".
+    """
+    parts = [title]
+    node = children[idx]
+    for sibling in children[idx + 1 :]:
+        if sibling.page_start != node.page_start or not parts[-1].endswith(":"):
+            break
+        text = _plain_heading(sibling.title)
+        if (
+            not text
+            or _section_signature(sibling.title) is not None
+            or is_back_matter(sibling.title)
+            or _is_toc_section(sibling.title)
+            or text.lower() in _FRONT_MATTER_TITLES
+            or not is_probable_heading(text)
+        ):
+            break
+        parts.append(text)
+    return " ".join(parts)
 
 
 def deduplicate_sections(sections: list[HeadingNode]) -> list[HeadingNode]:
@@ -1642,7 +1731,9 @@ def _build_document_summary(groups: list[GroupSynthesis], contradictions: list[d
 
 
 def fallback_document_overview(
-    groups: list[GroupSynthesis], contradictions: list[dict]
+    groups: list[GroupSynthesis],
+    contradictions: list[dict],
+    title: str | None = None,
 ) -> DocumentOverview:
     findings = list(
         dict.fromkeys(
@@ -1667,7 +1758,7 @@ def fallback_document_overview(
     if not summary_text and summaries:
         summary_text = _prefix_for_budget("；".join(summaries), 300)
     return DocumentOverview(
-        title="Document",
+        title=title or "Document",
         executive_summary=summary_text,
         research_question="证据不足",
         methods=[],
@@ -1760,6 +1851,42 @@ def _claim_tokens(value: str) -> set[str]:
 # "CoSER Test", "Tulu 3", "long-horizon" never match; "life reward training" (3
 # words) stays too.
 _ENGLISH_PROSE_RUN = re.compile(r"[A-Za-z]{3,}(?: [A-Za-z]{3,}){3,}")
+
+
+def _apply_document_title(result: DocumentOverview, candidate: str) -> DocumentOverview:
+    """Deterministic backstop for the overview title.
+
+    The overview prompt tells the model to keep the original document title
+    verbatim, but a flash model can still mangle or invent one. If the returned
+    title shares almost no tokens with the candidate (e.g. an invented
+    "多模态代理论坛" next to an English candidate), replace it with the
+    candidate -- but only when the candidate is actually consistent with the
+    content the model summarized. That consistency check guards against the
+    heading tree promoting an author byline or journal name to a heading: the
+    model would echo it faithfully (high overlap), and we must not force a wrong
+    title. A verbatim or same-language variant shares enough tokens and is kept;
+    a cross-language translation of an English candidate scores ~0.2 and is
+    overridden back to the original -- the intended behavior for a title.
+    """
+    if not candidate:
+        return result
+    answer_tokens = _claim_tokens(result.title)
+    if not answer_tokens:
+        result.title = candidate
+        return result
+    candidate_tokens = _claim_tokens(candidate)
+    overlap = len(answer_tokens & candidate_tokens) / len(answer_tokens)
+    coverage = len(answer_tokens & candidate_tokens) / len(candidate_tokens)
+    # overlap 高但 coverage 低 => 答案是候选标题的前缀/片段（模型截断回显，
+    # 如候选 "AGENT AI: Surveying..." 被回成 "AGENT AI:"），此时保留会得到一个
+    # 残缺标题，必须用候选覆盖；cross-language 翻译 overlap ~0.2 由 overlap<0.5 分支处理。
+    truncated = overlap >= 0.5 and coverage < 0.5
+    if overlap < 0.5 or truncated:
+        if candidate_tokens & _claim_tokens(
+            f"{result.executive_summary} {result.research_question}"
+        ):
+            result.title = candidate
+    return result
 
 
 def _strip_english_leak(answer: GlobalAnswer) -> GlobalAnswer:
@@ -2259,6 +2386,21 @@ def build_question_request(
             keywords = terms
             break
 
+    # The future-work route is the only one whose kind whitelist must be a hard
+    # filter rather than a soft score: kind_relevance gives "method" 0 here, but
+    # the additive keyword/section bonuses can still lift a method-implementation
+    # fact above the score>0 cutoff, letting implementation prose leak into
+    # "未来工作或改进方向是什么？" answers. Gate on the *resolved* route (its
+    # desired_kinds set is unique among all nine routes), not raw question text,
+    # so a question that merely contains 未来/改进 but routes elsewhere (e.g.
+    # "未来工作中计划使用哪些数据集？") is untouched. Skip the gate when the
+    # document has no limitation/result facts at all, so such a run does not
+    # degrade into an empty catalog / "证据不足".
+    future_route = desired_kinds == {"limitation", "result"}
+    has_limitation_or_result = any(
+        fact.get("kind") in {"limitation", "result"} for fact in fact_catalog
+    )
+
     section_title_routes = [
         (("数据集", "材料"), ("dataset", "data set", "material", "数据集", "材料")),
         (("主要方法", "采用"), ("method", "feature", "preprocess", "方法", "特征", "预处理")),
@@ -2308,6 +2450,16 @@ def build_question_request(
         return 10 if kind in desired_kinds else 0
 
     def score(fact: dict) -> tuple[int, float]:
+        if (
+            future_route
+            and has_limitation_or_result
+            and fact.get("kind") not in {"limitation", "result"}
+        ):
+            # Hard exclusion: a future-work answer may only cite limitation or
+            # result facts. Zero here is absolute -- the selection loop drops any
+            # fact with score <= 0, so no keyword/section bonus can rescue a
+            # method-implementation fact into the catalog.
+            return 0, float(fact.get("confidence", 0.0))
         text = f"{fact.get('concept', '')} {fact.get('statement', '')}".lower()
         title = re.sub(r"[^a-z0-9\u3400-\u9fff]+", " ", str(fact.get("section_title", "")).lower())
         value = kind_relevance(fact)
@@ -2383,6 +2535,7 @@ class LongDocumentPipeline:
         extract_max_output_tokens: int = 4096,
         reduce_max_output_tokens: int = 2200,
         document_max_output_tokens: int = 3000,
+        document_title: str | None = None,
     ):
         self.client = AsyncOpenAI(
             api_key=api_key,
@@ -2401,6 +2554,7 @@ class LongDocumentPipeline:
         self.extract_max_output_tokens = max(256, extract_max_output_tokens)
         self.reduce_max_output_tokens = max(256, reduce_max_output_tokens)
         self.document_max_output_tokens = max(256, document_max_output_tokens)
+        self.document_title = document_title
         self._document_fact_index: dict[str, dict] = {}
         self.group_fallbacks = 0
         # Truncation recovery budget: when a response is cut off mid-stream (or the
@@ -2891,20 +3045,24 @@ source_fact_ids 必须来自输入，只保留直接支持组摘要的最少证�
         detected_contradictions: list[dict],
     ) -> DocumentOverview:
         request = {**document_request, "questions": []}
+        if self.document_title:
+            request["candidate_title"] = self.document_title
         content = json.dumps(request, ensure_ascii=False, sort_keys=True)
         model = self._document_reduce_model()
         key = cache_key("document_overview", model, DOCUMENT_PROMPT_VERSION, content)
         cached = self.cache.get(key)
         if cached:
-            return DocumentOverview.model_validate(cached)
+            result = DocumentOverview.model_validate(cached)
+            return _apply_document_title(result, self.document_title)
         system = """你是全文总览归纳器。只能使用输入证据，不得增加外部知识。输出 JSON：
 {"title":"文档标题","executive_summary":"全文摘要","research_question":"研究问题","methods":["方法"],"datasets":["数据集"],"metrics":["指标"],"key_findings":["结论"],"limitations":["局限"],"future_work":["未来工作"],"contradictions":["矛盾"]}
 executive_summary 不超过300字，各数组最多10项。
 要求：
-1. 用自己的话概括，禁止把原文句子原样贴进摘要或数组。
-2. 论文含未来/展望/结论章节证据时 future_work 必须填写，不允许空数组。
-3. contradictions 只列证据支持的跨章节数字或结论冲突。
-4. 所有字段用中文填写：英文证据先翻译成中文再概括，禁止整句英文，只保留专有名词/指标名/模型名。"""
+1. executive_summary 必须写成一段连贯的中文叙述（200-300字）：先以一句总起句说明文档主题与研究对象，再按 研究问题→方法→主要结果→局限与未来工作 的顺序展开，句与句之间用"首先/此外/最后/总体而言"等衔接词过渡；禁止分点罗列，禁止用分号或顿号把零散事实堆叠成清单。
+2. title：优先使用输入 evidence 中的 candidate_title 字段原样保留（禁止翻译、改写或添加副标题）；candidate_title 缺失时才自行给出文档标题。
+3. 论文含未来/展望/结论章节证据时 future_work 必须填写，不允许空数组。
+4. contradictions 只列证据支持的跨章节数字或结论冲突。
+5. 其余字段（executive_summary 及各数组）用中文填写：英文证据先翻译成中文再概括，禁止整句英文，只保留专有名词/指标名/模型名；title 保留原语言。"""
         try:
             payload = await self._request_json(
                 "document_overview",
@@ -2916,7 +3074,10 @@ executive_summary 不超过300字，各数组最多10项。
             )
             result = DocumentOverview.model_validate(payload)
         except RuntimeError:
-            result = fallback_document_overview(groups, detected_contradictions)
+            result = fallback_document_overview(
+                groups, detected_contradictions, title=self.document_title
+            )
+        result = _apply_document_title(result, self.document_title)
         self.cache.put(key, result.model_dump())
         return result
 
@@ -3059,11 +3220,19 @@ source_fact_ids 必须来自 fact_catalog；章节和页码留空，由程序反
             detected_contradictions,
             max_tokens=min(max_tokens, 2400),
         )
-        content = json.dumps(document_request, ensure_ascii=False, sort_keys=True)
+        bundle_scope = {"document_request": document_request}
+        if self.document_title:
+            # 候选标题决定 bundle 的 title，必须折进缓存键，否则标题随代码演进变化时
+            # document_overview 走不到（bundle 命中即短路返回），仍回旧标题。
+            bundle_scope["candidate_title"] = self.document_title
+        content = json.dumps(bundle_scope, ensure_ascii=False, sort_keys=True)
         key = cache_key("document_bundle", self.flash_model, DOCUMENT_PROMPT_VERSION, content)
         cached = self.cache.get(key)
         if cached:
             result = DocumentSynthesis.model_validate(cached)
+            # bundle 里缓存的 title 可能来自候选标题修正前的旧版模型输出（截断回显），
+            # 命中后同样过一遍确定性兜底，保证展示 title 恒等于候选标题。
+            result = _apply_document_title(result, self.document_title)
             effective_contradictions = _merge_overview_contradictions(
                 detected_contradictions, result.contradictions, self._document_fact_index
             )
@@ -3242,7 +3411,7 @@ def _load_env_file() -> None:
 
 async def _run(args: argparse.Namespace) -> None:
     _load_env_file()
-    _, sections = preprocess_pdf(args.pdf, args.include_back_matter)
+    root, sections = preprocess_pdf(args.pdf, args.include_back_matter)
     if args.section:
         terms = [term.lower() for term in args.section]
         sections = [section for section in sections if any(term in section.title.lower() for term in terms)]
@@ -3275,6 +3444,7 @@ async def _run(args: argparse.Namespace) -> None:
         extract_max_output_tokens=args.extract_max_output_tokens,
         reduce_max_output_tokens=args.reduce_max_output_tokens,
         document_max_output_tokens=args.document_max_output_tokens,
+        document_title=_candidate_document_title(root),
     )
     try:
         results = []
