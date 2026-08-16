@@ -1000,6 +1000,38 @@ def _cell_is_numeric(cell: str) -> bool:
     return bool(re.fullmatch(r"\d+(?:\.\d+)?\s*%?", stripped))
 
 
+_LEADING_STRAY_CLOSERS_RE = re.compile(r"^[)\]}）】」]+")
+_BRACKET_PAIRS = (("(", ")"), ("（", "）"), ("[", "]"), ("【", "】"), ("{", "}"))
+
+
+def _repair_header_name(name: str) -> str:
+    """Clean deterministic noise left by pymupdf4llm splitting a wide header
+    cell into fragment columns (``Reward (z-score)`` -> ``Reward`` / ``(z-score``
+    / ``)``) that then stack across header rows. ``) Soc. (Δ)`` becomes
+    ``Soc. (Δ)`` and ``(z-score Econ.`` becomes ``Econ.``. Balanced names such as
+    ``Accuracy (%)`` or ``Soc. (Δ)`` and bracket-free names are left untouched.
+    """
+    cleaned = re.sub(_LEADING_STRAY_CLOSERS_RE, "", name).strip()
+    # A dangling opener never closed within the name is a fragment of a
+    # neighbouring cell — drop the fragment token that begins at it.
+    for opener, closer in _BRACKET_PAIRS:
+        if opener not in cleaned:
+            continue
+        if closer in cleaned:
+            continue  # balanced — a genuine name like ``(Δ)``
+        start = cleaned.find(opener)
+        space = cleaned.find(" ", start)
+        end = space if space != -1 else len(cleaned)
+        cleaned = (cleaned[:start] + cleaned[end:]).strip()
+        break
+    # A stray closer with no opener in the name (its opener lived in the
+    # neighbouring fragment column) is a lone noise character.
+    for opener, closer in _BRACKET_PAIRS:
+        if opener not in cleaned and closer in cleaned:
+            cleaned = cleaned.replace(closer, "")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def _merge_table_headers(header_rows: list[list[str]]) -> list[str]:
     """Merge multi-row table headers into one composite header per column.
 
@@ -1020,7 +1052,8 @@ def _merge_table_headers(header_rows: list[list[str]]) -> list[str]:
     seen: dict[str, int] = {}
     headers: list[str] = []
     for column, part in enumerate(parts):
-        name = " ".join(part) if part else f"column_{column + 1}"
+        raw = " ".join(part) if part else f"column_{column + 1}"
+        name = _repair_header_name(raw) or f"column_{column + 1}"
         count = seen.get(name, 0)
         headers.append(name if count == 0 else f"{name} #{count + 1}")
         seen[name] = count + 1
@@ -1088,6 +1121,24 @@ def _table_rows(text: str) -> list[tuple[str, list[str], list[list[str]], list[s
     return tables
 
 
+def _row_is_config_row(table: str, metric: str, row_context: dict[str, str]) -> bool:
+    """True when a numeric table row is a config/parameter value, not an
+    evaluation result. Mirrors the retrieval-time config penalty
+    (``_GENERIC_METRIC_COLUMNS`` / ``_CONFIG_TABLE_MARKERS``) at the source, so
+    config rows never enter the fact DB as ``kind="metric"`` noise in the first
+    place. A row counts as config when its numeric column has a generic label
+    AND the table is flagged as config OR every row-context key is itself a
+    generic label — genuine result columns like ``Total``/``Mood`` under a
+    ``Model`` context survive."""
+    generic_column = metric.strip().lower() in _GENERIC_METRIC_COLUMNS
+    marker_text = " ".join([table, metric, *row_context.values()]).lower()
+    config_marker = any(marker in marker_text for marker in _CONFIG_TABLE_MARKERS)
+    generic_context = bool(row_context) and all(
+        key.strip().lower() in _GENERIC_METRIC_COLUMNS for key in row_context
+    )
+    return generic_column and (config_marker or generic_context)
+
+
 def extract_table_facts(section: HeadingNode) -> list[TableFact]:
     page_texts = section.page_texts or [PageMarkdown(page=section.page_start, text=section.text)]
     facts: list[TableFact] = []
@@ -1124,6 +1175,11 @@ def extract_table_facts(section: HeadingNode) -> list[TableFact]:
                         continue
                     value, display_value, cell_unit = parsed
                     metric = headers[column]
+                    if _row_is_config_row(table, metric, row_context):
+                        # A config/parameter value is not an evaluation metric;
+                        # keep it out of the fact DB entirely (the retrieval
+                        # layer used to sink it after the fact).
+                        continue
                     unit = "%" if "%" in metric or cell_unit == "%" else cell_unit
                     context_text = "; ".join(f"{key}={value}" for key, value in row_context.items())
                     statement = f"{table}: {context_text}; {metric}={display_value}{unit}"

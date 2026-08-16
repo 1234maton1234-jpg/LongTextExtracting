@@ -35,6 +35,8 @@ from p2g_v2 import (  # noqa: E402
     _merge_overview_contradictions,
     _merge_table_headers,
     _normalize_levels,
+    _repair_header_name,
+    _row_is_config_row,
     _recover_answer_fact_ids,
     _strip_english_leak,
     _table_rows,
@@ -1085,6 +1087,98 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual(headers[2], "Tuned")
         self.assertEqual(headers[6], "Tuned #3")
         self.assertEqual(len(set(headers)), len(headers))
+
+    def test_repair_header_name_fixes_fragment_noise(self):
+        # pymupdf4llm splits a wide header cell into fragment columns that then
+        # stack into names carrying a dangling bracket from a neighbour.
+        self.assertEqual(_repair_header_name("(z-score Econ."), "Econ.")
+        self.assertEqual(_repair_header_name(") Soc. (Δ)"), "Soc. (Δ)")
+        self.assertEqual(_repair_header_name("nt (z-scor Esteem"), "nt Esteem")
+        self.assertEqual(_repair_header_name("e) Material"), "e Material")
+
+    def test_repair_header_name_keeps_balanced_and_clean_names(self):
+        # Balanced or bracket-free names are genuine headers — never touched.
+        self.assertEqual(_repair_header_name("Accuracy (%)"), "Accuracy (%)")
+        self.assertEqual(_repair_header_name("Reward (z-score)"), "Reward (z-score)")
+        self.assertEqual(_repair_header_name("Soc. (Δ)"), "Soc. (Δ)")
+        self.assertEqual(_repair_header_name("Claude 4.5-Opus"), "Claude 4.5-Opus")
+        self.assertEqual(_repair_header_name("Reward Subj."), "Reward Subj.")
+
+    def test_merge_table_headers_repairs_fragment_cells(self):
+        headers = _merge_table_headers([["Model", "Reward", "(z-score", ")", "Mood"]])
+        self.assertEqual(headers[0], "Model")
+        self.assertEqual(headers[1], "Reward")
+        self.assertEqual(headers[4], "Mood")
+        self.assertNotIn("(z-score", headers)
+        self.assertNotIn(")", headers)
+
+    def test_table_facts_skip_config_rows_at_source(self):
+        # A config table's numeric "Value" column must not enter the fact DB as
+        # kind="metric" noise — it is skipped at extraction, not just at
+        # retrieval time.
+        section = flatten_sections(
+            build_heading_tree(
+                [
+                    PageMarkdown(
+                        page=5,
+                        text=(
+                            "# 8 Discussion\n"
+                            "**Table 8** Key configuration parameters used in the simulation.\n"
+                            "|Setting|Value|\n"
+                            "|---|---|\n"
+                            "|max_seq_len|4096|\n"
+                            "|learning_rate|0.1|\n"
+                        ),
+                    )
+                ]
+            )
+        )[0]
+        self.assertEqual(extract_table_facts(section), [])
+
+    def test_table_facts_skip_config_rows_without_table_marker(self):
+        # Even without a config-ish caption, a generic "Value" column over an
+        # all-generic context is still a config row, not a result.
+        section = flatten_sections(
+            build_heading_tree(
+                [
+                    PageMarkdown(
+                        page=5,
+                        text=(
+                            "# 8 Discussion\n"
+                            "**Table 5** Model settings\n"
+                            "|Setting|Value|\n"
+                            "|---|---|\n"
+                            "|max_seq_len|4096|\n"
+                        ),
+                    )
+                ]
+            )
+        )[0]
+        self.assertEqual(extract_table_facts(section), [])
+
+    def test_table_facts_keep_generic_column_under_model_context(self):
+        # A generic-named result column (Total/Mood) under a "Model" context is
+        # a genuine result, not a config row — it must survive the source skip.
+        section = flatten_sections(
+            build_heading_tree(
+                [
+                    PageMarkdown(
+                        page=40,
+                        text=(
+                            "# 8 Discussion\n"
+                            "**Table 13** Model comparison: reward and fulfillment metrics\n"
+                            "|Model|Total|Mood|\n"
+                            "|---|---|---|\n"
+                            "|Qwen3.5-27B|10|5|\n"
+                        ),
+                    )
+                ]
+            )
+        )[0]
+        facts = extract_table_facts(section)
+        metrics = {fact.metric for fact in facts}
+        self.assertIn("Total", metrics)
+        self.assertIn("Mood", metrics)
 
     def test_table_rows_consumes_two_row_header_into_data_start(self):
         # Table 3 in the real paper: two header rows, only one separator. The
