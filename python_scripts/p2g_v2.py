@@ -38,7 +38,7 @@ PICTURE_TEXT_BLOCK_RE = re.compile(
 )
 IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 MARK_TAG_RE = re.compile(r"</?mark\b[^>]*>", re.IGNORECASE)
-EXTRACTION_PROMPT_VERSION = "v2.8"
+EXTRACTION_PROMPT_VERSION = "v2.9"
 REDUCE_PROMPT_VERSION = "v2.8"
 GROUP_PROMPT_VERSION = "v2.10"
 DOCUMENT_PROMPT_VERSION = "v2.16"
@@ -2766,7 +2766,8 @@ class LongDocumentPipeline:
         system = """你是严格的长文事实抽取器。只抽取原文明确支持的信息，并输出 JSON：
 {"summary":"本块摘要","facts":[{"concept":"概念","statement":"事实","kind":"definition|formula|method|result|limitation|advantage|disadvantage|example|relation|classification|dataset|metric","source_quote":"原文逐字引用","page":1,"confidence":0.95}],"new_concepts":["概念"]}
 source_quote 必须是原文中的连续文本；不得补充原文没有的因果关系。直接逐字证据通常使用 0.8-1.0 的置信度，不要机械照抄示例值。
-statement 必须用中文概括原文语义：原文是英文时翻译成中文，只保留专有名词、指标名、模型名等原文术语，禁止整句照抄英文原文。"""
+statement 必须用中文概括原文语义：原文是英文时翻译成中文，只保留专有名词、指标名、模型名等原文术语，禁止整句照抄英文原文。
+每个块最多输出 20 条事实；候选超过 20 条时优先保留信息量最大、置信度最高的。source_quote 尽量简短（约 80 字以内），足以在原文中定位即可。"""
         user = json.dumps(
             {
                 "section": section.title,
@@ -2784,6 +2785,7 @@ statement 必须用中文概括原文语义：原文是英文时翻译成中文�
                 user,
                 response_model=ChunkExtraction,
                 max_output_tokens=self.extract_max_output_tokens,
+                reasoning_effort="none",
             )
         except RuntimeError as error:
             if self.pro_model and self.pro_model != self.flash_model:
@@ -3325,7 +3327,7 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--content-retries", type=int, default=3)
     parser.add_argument("--retry-base-seconds", type=float, default=1.0)
-    parser.add_argument("--extract-max-output-tokens", type=int, default=4000)
+    parser.add_argument("--extract-max-output-tokens", type=int, default=4096)
     parser.add_argument("--reduce-max-output-tokens", type=int, default=2200)
     parser.add_argument("--document-max-output-tokens", type=int, default=3000)
     parser.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")

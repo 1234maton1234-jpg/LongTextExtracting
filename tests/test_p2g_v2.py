@@ -13,7 +13,9 @@ sys.path.insert(0, str(PROJECT_ROOT / "python_scripts"))
 
 from p2g_v2 import (  # noqa: E402
     HeadingNode,
+    TextChunk,
     ConceptMemory,
+    ResultCache,
     ChunkExtraction,
     DocumentSynthesis,
     GLOBAL_QUESTIONS,
@@ -2161,6 +2163,87 @@ class RequestRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completions.kwargs[2]["reasoning_effort"], "none")
         self.assertEqual(len(completions.kwargs[2]["messages"]), 2)
         await self._cleanup_usage(pipeline)
+
+    async def _make_extract_pipeline(self, scripted_responses):
+        """Minimal pipeline wired for extract_chunk: adds cache/memory/flash-model
+        on top of the recovery helper so the full prompt + first-call kwargs are
+        visible via FakeCompletions."""
+        pipeline, completions = await self._make_recovery_pipeline(scripted_responses)
+        pipeline.flash_model = "flash"
+        pipeline.pro_model = None
+        pipeline.extract_max_output_tokens = 4096
+        self._extract_dir = tempfile.mkdtemp()
+        pipeline.cache = ResultCache(Path(self._extract_dir) / "cache.sqlite3")
+        pipeline.memory = ConceptMemory(Path(self._extract_dir) / "memory.sqlite3")
+        return pipeline, completions
+
+    async def _cleanup_extract(self, pipeline) -> None:
+        pipeline.cache.close()
+        pipeline.memory.close()
+        await self._cleanup_usage(pipeline)
+        shutil.rmtree(self._extract_dir, ignore_errors=True)
+
+    async def test_extract_chunk_initial_call_thinks_off(self):
+        # The first flash extraction call must not burn the output budget on
+        # reasoning: reasoning_effort="none", max_tokens aligned to the pipeline
+        # budget (4096), while all later stages keep their default "low".
+        valid = {
+            "summary": "摘要",
+            "facts": [
+                {
+                    "concept": "概念",
+                    "statement": "事实",
+                    "kind": "result",
+                    "source_quote": "原文",
+                    "page": 1,
+                    "confidence": 0.9,
+                }
+            ],
+            "new_concepts": [],
+        }
+        pipeline, completions = await self._make_extract_pipeline(
+            [("stop", json.dumps(valid, ensure_ascii=False))]
+        )
+        section = HeadingNode(
+            id="s1", title="方法", level=2,
+            page_start=1, page_end=1, subtree_page_end=1,
+        )
+        chunk = TextChunk(index=0, text="原文", token_estimate=10)
+
+        result = await pipeline.extract_chunk(section, chunk)
+
+        self.assertEqual(len(result.facts), 1)
+        self.assertEqual(completions.calls, 1)
+        first = completions.kwargs[0]
+        self.assertEqual(first["reasoning_effort"], "none")
+        self.assertEqual(first["max_tokens"], pipeline.extract_max_output_tokens)
+        # result is written to cache so a second call would hit (prompt unchanged)
+        self.assertEqual(pipeline.cache.summary()["misses"], 1)
+        await self._cleanup_extract(pipeline)
+
+    async def test_extract_chunk_prompt_caps_output(self):
+        # The extraction prompt must bound output size so dense chunks stay under
+        # the budget: a fact-count cap and a short source_quote instruction.
+        valid = {
+            "summary": "摘要",
+            "facts": [],
+            "new_concepts": [],
+        }
+        pipeline, completions = await self._make_extract_pipeline(
+            [("stop", json.dumps(valid, ensure_ascii=False))]
+        )
+        section = HeadingNode(
+            id="s1", title="方法", level=2,
+            page_start=1, page_end=1, subtree_page_end=1,
+        )
+        chunk = TextChunk(index=0, text="原文", token_estimate=10)
+
+        await pipeline.extract_chunk(section, chunk)
+
+        system_prompt = completions.kwargs[0]["messages"][0]["content"]
+        self.assertIn("最多输出 20 条", system_prompt)
+        self.assertIn("source_quote 尽量简短", system_prompt)
+        await self._cleanup_extract(pipeline)
 
 
 if __name__ == "__main__":
