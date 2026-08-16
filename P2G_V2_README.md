@@ -24,13 +24,14 @@
    - 章节层级归一化（`_normalize_levels`）：用 `###`/`####` 表示主/子章节的论文，把"编号章节的最小层级"整体平移到 L2。综述层级从 `{L1:1, L3:14, L4:65}` 归一到 `{L1:1, L2:14, L3:65}`。
 7. 表格事实源头净化（V2.20）：
    - 配置表数值行不再进入事实库（`_row_is_config_row`）：数值列名是通用标签（Value/Setting/Parameter/…）且表含配置标记或行上下文键全为通用标签时，该行在抽取源头就被跳过，不再以 `kind="metric"` 写进事实库和证据索引（此前 V2.18 只在检索打分时压掉）。真实结果表的通用列名（如 `Total`/`Mood`）在 `Model` 上下文下仍保留。
-   - 碎片表头清洗（`_repair_header_name`）：pymupdf4llm 把宽表头拆成跨列碎片（`Reward (z-score)` → `Reward / (z-score / )`）再堆叠成 `(z-score Econ.`、`) Soc. (Δ)` 这类带悬空括号的噪声指标名；合并表头时对悬空开/闭括号做确定性清理。真实输出中 67 个指标名里的 4 个噪声名被修复。
+   - 碎片表头清洗（`_repair_header_name`）：pymupdf4llm 把宽表头拆成跨列碎片（`Reward (z-score)` → `Reward / (z-score / )`）再堆叠成 `(z-score Econ.`、`) Soc. (Δ)` 这类带悬空括号的噪声指标名；合并表头时对悬空开/闭括号做确定性清理。全量复跑确认：噪声指标名 0 残留，`(z-score Econ.`→`Econ.`、`e) Material`→`e Material`、`nt (z-scor Esteem`→`nt Esteem`、`) Soc. (Δ)`→`Soc. (Δ)`。
 
 ## 已验证基线（当前状态）
 
 - **Agentopia**（25 节含附录）完整运行：10/10 全局问答全部带可定位页码出处、零幻觉、零英文泄漏；"矛盾"问题升级为 3 条可溯源矛盾（9 个事实、跨 6 页）；未来工作 4 条、局限 10 条。
+- **V2.20 表事实净化复跑**（同一份 Agentopia PDF，缓存重跑约 16 分钟，本次仅 117 次 API 调用）：Table 8 配置行 22 条 `Value` 指标事实**从源头清零**；表头碎片噪声 `(z-score Econ.`/`e) Material`/`nt (z-scor Esteem`/`) Soc. (Δ)` **0 残留**，替换为 `Econ.`/`e Material`/`nt Esteem`/`Soc. (Δ)`；10/10 问答依旧全部带页码出处，"评价指标"问题确认回答 RoleEval/InCharacter/LifeChoice 等真实指标而非 "Table 8:"；"未来工作"问题不再混入局限内容。
 - **Agent AI 综述**（80 页、80 节）实测：10/10 问答全部有真实出处、无幻觉；综述类论文无数值表格时"矛盾"问题正确答"证据不足"。
-- 单元测试 **87 个全部通过**。
+- 单元测试 **93 个全部通过**。
 
 ## 仍存在的问题
 
@@ -59,7 +60,7 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 powershell -ExecutionPolicy Bypass -File .\test.ps1
 ```
 
-预期结果为 `87 tests ... OK`。
+预期结果为 `93 tests ... OK`。
 
 ## 先做免费 Dry Run
 
