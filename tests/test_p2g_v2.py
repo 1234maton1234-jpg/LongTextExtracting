@@ -42,6 +42,8 @@ from p2g_v2 import (  # noqa: E402
     _table_rows,
     build_heading_tree,
     _merge_low_signal_sections,
+    _merge_fragment_leaves,
+    _should_merge_fragment_leaf,
     build_document_request,
     build_question_request,
     cache_key,
@@ -164,6 +166,103 @@ class HeadingTreeTests(unittest.TestCase):
 
         self.assertEqual(parent.children, [])
         self.assertIn("角色说明", parent.text)
+
+    def test_merges_small_numbered_leaf_into_parent(self):
+        root = HeadingNode(id="root", title="Document", level=0, page_start=1, page_end=1, subtree_page_end=1)
+        parent = HeadingNode(id="s91", title="9.1 Evaluation", level=3, page_start=1, page_end=1, subtree_page_end=1)
+        root.children.append(parent)
+        child = HeadingNode(id="s912", title="9.1.2 Task", level=4, page_start=2, page_end=2, subtree_page_end=2)
+        child.text = "该子节描述一个具体任务。"
+        child.page_texts = [PageMarkdown(page=2, text="该子节描述一个具体任务。")]
+        parent.children.append(child)
+
+        _merge_fragment_leaves(root)
+
+        self.assertEqual(parent.children, [])
+        self.assertIn("#### 9.1.2 Task", parent.text)
+        self.assertIn("该子节描述一个具体任务。", parent.text)
+        self.assertEqual(parent.page_end, 2)
+
+    def test_keeps_main_numbered_section(self):
+        root = HeadingNode(id="root", title="Document", level=0, page_start=1, page_end=1, subtree_page_end=1)
+        parent = HeadingNode(id="p", title="Back Matter", level=2, page_start=1, page_end=1, subtree_page_end=1)
+        root.children.append(parent)
+        main = HeadingNode(id="c6", title="6 Conclusion", level=3, page_start=1, page_end=1, subtree_page_end=1)
+        main.text = "结论内容。"
+        main.page_texts = [PageMarkdown(page=1, text="结论内容。")]
+        parent.children.append(main)
+
+        self.assertFalse(_should_merge_fragment_leaf(main))  # number:6, no sub-number
+        _merge_fragment_leaves(root)
+        self.assertEqual(parent.children, [main])
+
+    def test_keeps_large_numbered_leaf(self):
+        root = HeadingNode(id="root", title="Document", level=0, page_start=1, page_end=1, subtree_page_end=1)
+        parent = HeadingNode(id="s91", title="9.1 Evaluation", level=3, page_start=1, page_end=1, subtree_page_end=1)
+        root.children.append(parent)
+        body = "这是一个内容充实的子节，包含大量细节描述。" * 45
+        child = HeadingNode(id="s912", title="9.1.2 Task", level=4, page_start=2, page_end=2, subtree_page_end=2)
+        child.text = body
+        child.page_texts = [PageMarkdown(page=2, text=body)]
+        parent.children.append(child)
+
+        self.assertGreater(estimate_tokens(body), 500)
+        _merge_fragment_leaves(root)
+        self.assertEqual(parent.children, [child])
+
+    def test_keeps_section_with_children_and_unnumbered_leaf(self):
+        root = HeadingNode(id="root", title="Document", level=0, page_start=1, page_end=1, subtree_page_end=1)
+        parent = HeadingNode(id="s91", title="9.1 Evaluation", level=3, page_start=1, page_end=1, subtree_page_end=1)
+        root.children.append(parent)
+        body = "这是一个内容充实的子节，包含大量细节描述。" * 45
+        child = HeadingNode(id="s911", title="9.1.1 Long Task", level=4, page_start=2, page_end=2, subtree_page_end=2)
+        child.text = body
+        child.page_texts = [PageMarkdown(page=2, text=body)]
+        parent.children.append(child)
+        unnumbered = HeadingNode(id="rw", title="Related Work", level=3, page_start=3, page_end=3, subtree_page_end=3)
+        unnumbered.text = "相关工作介绍。"
+        unnumbered.page_texts = [PageMarkdown(page=3, text="相关工作介绍。")]
+        parent.children.append(unnumbered)
+
+        _merge_fragment_leaves(root)
+
+        # 9.1 itself has children -> kept; 9.1.1 Long Task too large -> kept;
+        # Related Work has no numeric signature -> kept.
+        self.assertEqual([c.title for c in parent.children], ["9.1.1 Long Task", "Related Work"])
+
+    def test_keeps_low_level_numbered_leaf(self):
+        root = HeadingNode(id="root", title="Document", level=0, page_start=1, page_end=1, subtree_page_end=1)
+        parent = HeadingNode(id="s6", title="6 Evaluation", level=2, page_start=1, page_end=1, subtree_page_end=1)
+        root.children.append(parent)
+        sub = HeadingNode(id="s61", title="6.1 Data", level=2, page_start=1, page_end=1, subtree_page_end=1)
+        sub.text = "数据说明。"
+        sub.page_texts = [PageMarkdown(page=1, text="数据说明。")]
+        parent.children.append(sub)
+
+        self.assertFalse(_should_merge_fragment_leaf(sub))  # level <= 2
+        _merge_fragment_leaves(root)
+        self.assertEqual(parent.children, [sub])
+
+    def test_merge_fragment_leaves_via_build_heading_tree(self):
+        pages = [
+            PageMarkdown(
+                page=1,
+                text=(
+                    "# 1 Introduction\n导言内容。\n"
+                    "## 1.1 Related Work\n相关工作介绍。\n"
+                    "### 1.1.1 Task\n" + ("这是子节的内容。" * 30) + "\n"
+                    "# 2 Conclusion\n总结。"
+                ),
+            )
+        ]
+        sections = flatten_sections(build_heading_tree(pages))
+        self.assertEqual(
+            [section.title for section in sections],
+            ["1 Introduction", "1.1 Related Work", "2 Conclusion"],
+        )
+        related = sections[1]
+        self.assertIn("### 1.1.1 Task", related.text)
+        self.assertIn("这是子节的内容。", related.text)
 
     def test_rejects_sentence_like_and_case_style_headings(self):
         pages = [
@@ -1790,13 +1889,14 @@ class LevelNormalizationTests(unittest.TestCase):
         self.assertEqual(root.children[0].children[0].level, 3)
 
     def test_heading_tree_integration_rebases_numbered_sections(self):
-        # Keep bodies long so the low-signal merge (<=220 chars) does not absorb
-        # the sections before level normalization runs.
+        # Keep bodies long so the low-signal merge (<=220 chars) and the
+        # fragment merge (<=500 tokens) do not absorb the sections before level
+        # normalization runs.
         pages = [
             PageMarkdown(page=1, text=(
                 "# The Title\n"
                 "### 1 Introduction\n" + ("intro text " * 60) + "\n"
-                "#### 1.1 Motivation\n" + ("motivation text " * 60) + "\n"
+                "#### 1.1 Motivation\n" + ("motivation text " * 200) + "\n"
                 "### 2 Method\n" + ("method text " * 60)
             )),
         ]

@@ -583,6 +583,7 @@ def build_heading_tree(pages: list[PageMarkdown]) -> HeadingNode:
 
     _absorb_noise_nodes(root)
     _merge_low_signal_sections(root)
+    _merge_fragment_leaves(root)
     _normalize_levels(root)
     propagate(root)
     return root
@@ -687,6 +688,57 @@ def _should_merge_child(child: HeadingNode) -> bool:
     if len(title.split()) <= 2 and child.text.strip() and len(child.text.strip()) <= 220:
         return not CJK_RE.search(title)
     return False
+
+
+# Small numbered leaf sections (a one-paragraph ``9.1.2 Task``) each pay a full
+# extraction + synthesis round, so a survey with 60+ single-paragraph sub-
+# sections multiplies API calls. Merging a small numbered leaf up one level
+# collapses those rounds into one chunked pass over the parent; the sub-section's
+# own heading line is kept inside the merged body so its number still anchors
+# evidence for sub-section-level questions.
+_FRAGMENT_MERGE_MAX_TOKENS = 500
+
+
+def _should_merge_fragment_leaf(child: HeadingNode) -> bool:
+    """True for a tiny sub-section that is a fragment, not a section worth its
+    own extraction round: a leaf (no children), below the L2 main level, with a
+    numeric signature that carries a sub-number (``number:5.4``, never a main
+    ``number:5``), and a body within ``_FRAGMENT_MERGE_MAX_TOKENS``."""
+    if child.children:
+        return False
+    if child.level <= 2:
+        return False
+    signature = _section_signature(child.title)
+    if not (signature and signature.startswith("number:")):
+        return False
+    if "." not in signature:
+        return False  # main section ("5"), not a sub-section ("5.4")
+    return estimate_tokens(child.text) <= _FRAGMENT_MERGE_MAX_TOKENS
+
+
+def _merge_fragment_leaves(node: HeadingNode) -> None:
+    """Merge eligible fragment leaves into ``node``, keeping each child's
+    heading line as a marker at the top of the merged body. Runs after
+    ``_merge_low_signal_sections`` and before ``_normalize_levels`` (both merge
+    and level-rebasing guard on the raw markdown level)."""
+    node.children = [child for child in node.children if child is not None]
+    for child in list(node.children):
+        _merge_fragment_leaves(child)
+
+    merged_children: list[HeadingNode] = []
+    for child in list(node.children):
+        if not _should_merge_fragment_leaf(child):
+            merged_children.append(child)
+            continue
+        marker = f"{'#' * child.level} {child.title}".strip()
+        body = marker if not child.text.strip() else f"{marker}\n{child.text}".strip()
+        node.text = f"{node.text}\n{body}".strip() if node.text.strip() else body
+        if child.page_texts:
+            child.page_texts[0].text = f"{marker}\n{child.page_texts[0].text}".strip()
+            node.page_texts.extend(child.page_texts)
+        node.page_end = max(node.page_end, child.page_end)
+        node.subtree_page_end = max(node.subtree_page_end, child.subtree_page_end)
+    node.children = merged_children
 
 
 def _normalize_levels(root: HeadingNode) -> None:
