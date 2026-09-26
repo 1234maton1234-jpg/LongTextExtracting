@@ -94,6 +94,31 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1 `
 - `contradictions` 是否能发现跨页数字或结论冲突。
 - `stats.usage` 可查看**本次运行**的请求数、Token 和耗时（含 `run_started_at` 起始时间戳）；`stats.all_time_usage` 是 usage 数据库的**历史累计**值。两者分开统计——usage 库是追加共享的，早先版本把累计值当成本次运行数据，会严重高估单次成本。`stats.cache` 的 `hits`/`misses` 本身就是本次运行的计数。
 
+## 溯源指标（可回归的质量度量）
+
+输出 JSON 的 `evidence_metrics` 给出本次运行的确定性溯源指标，**不额外调用任何模型**，同一份输入必然得到同一结果：
+
+| 字段 | 含义 |
+|------|------|
+| `fact_count` | 可作为证据的事实总数（仅计 `grounded=true`，含表格/指标/矛盾派生事实） |
+| `answers_with_evidence` | 10 问中**至少引用 1 条事实**的题数——低于 10 就说明有题目无证据可依 |
+| `citation_precision` | 引用的 fact_id 中能在事实索引里解析到的比例 |
+| `unsupported_claim_rate` | 无据句子占全部答案句子的比例 |
+| `min/median/max_cited_facts` | 每题引用事实数的分布（`min` **包含**零引用的题，否则会掩盖"某题完全没证据"这一最该被抓的情况） |
+| `sufficient_evidence` | 该题是否达到证据下限（至少 1 条可支持本答案的引用事实） |
+| `per_answer` | 逐题明细，便于定位是哪一问退化 |
+
+**读法上的两个要点：**
+
+1. `citation_precision` 在本系统中**接近恒定 1.0**：`_recover_answer_fact_ids` 会主动剔除不在证据白名单里的 fact_id，所以它天然无法下降。它的作用是**发现异常**（例如输出被流水线之外的程序拼装过），**不是**质量卖点。
+2. `unsupported_claim_rate` 度量的是**接地性**（每句话是否在引用的事实里有依据），**不度量切题性**（答案是否回答了问题）。一条完全答非所问但确有原文依据的句子同样会得 0 分——切题性需要基准答案才能评，不在本指标范围内。
+
+不重跑流水线也能对已有输出结算指标（无需 PDF 与 API Key）：
+
+```powershell
+.\.venv\Scripts\python.exe python_scripts\p2g_v2.py --metrics outputs\p2g_v2_output.json
+```
+
 系统优先检索当前论文的 Abstract / Results / Discussion / Conclusion，降低 Related Work 对定量结论的干扰。模型返回空、伪造或不支持答案的事实 ID 时，程序只从本次问题的证据白名单中最多选择 3 条；仍无法支持时会直接使用已验证事实作保守答案。
 
 全局问答的证据审计按句子粒度执行：有证据的句子保留为答案，无证据的句子移入 `unsupported_claims` 供审查，不再因混入一句无证据内容而整条丢弃。"矛盾"问题不经过句子审计，直接把确定性数值矛盾与总览发现的矛盾合并列出，并对每条语句尝试匹配回事实以附带页码出处。

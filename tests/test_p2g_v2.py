@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import io
 import json
 import shutil
 import sys
@@ -73,6 +75,10 @@ from p2g_v2 import (  # noqa: E402
     _grounded_payload,
     batch_by_token_budget,
     build_section_evidence,
+    run_evidence_metrics,
+    report_evidence_metrics,
+    _answer_sentences,
+    _quantile,
 )
 
 
@@ -646,6 +652,210 @@ class ConceptMemoryTests(unittest.TestCase):
                 "the Knowledge Augmented Transformer (KAT)",
             )
         )
+
+
+class EvidenceMetricsTests(unittest.TestCase):
+    """Deterministic provenance metrics over a finished run.
+
+    These are the regression signals for the understanding layer: without them,
+    "the 评价指标 answer degenerated" was only visible by reading output by hand.
+    """
+
+    def _section(self, facts, section_id="s1", title="T"):
+        return {
+            "section": {
+                "id": section_id, "title": title,
+                "page_start": 1, "page_end": 1,
+            },
+            "extractions": [{"summary": "s", "facts": facts}],
+            "table_facts": [],
+            "detected_facts": [],
+            "metric_facts": [],
+            "numeric_contradictions": [],
+            "synthesis": {
+                "summary": "s", "core_concepts": [], "key_findings": [],
+                "source_pages": [1], "title": title,
+            },
+        }
+
+    def _fact(self, fact_id, page=1, grounded=True, statement="一句足够长的陈述内容用来检验证据是否充分"):
+        return {
+            "fact_id": fact_id, "concept": "C", "statement": statement,
+            "kind": "definition", "source_quote": "q", "page": page,
+            "confidence": 0.9, "grounded": grounded,
+        }
+
+    def _answer(self, question, answer, fact_ids, unsupported=None, pages=None):
+        return {
+            "question": question, "answer": answer,
+            "source_fact_ids": list(fact_ids),
+            "source_sections": ["s1"] if fact_ids else [],
+            "source_pages": list(pages if pages is not None else ([1] if fact_ids else [])),
+            "confidence": 0.8,
+            "unsupported_claims": list(unsupported or []),
+        }
+
+    def test_sentence_split_ignores_the_insufficient_marker(self):
+        self.assertEqual([], _answer_sentences("证据不足"))
+        self.assertEqual([], _answer_sentences(""))
+        self.assertEqual(["一。", "二。"], _answer_sentences("一。二。"))
+
+    def test_quantile_spans_zero_citation_answers(self):
+        # Excluding zero-evidence answers would hide the failure the metric exists
+        # to catch, so min must be able to reach 0.
+        self.assertEqual(0, _quantile([], 0.5))
+        self.assertEqual(0, _quantile([0, 1, 5], 0.0))
+        self.assertEqual(5, _quantile([0, 1, 5], 1.0))
+        self.assertEqual(1, _quantile([0, 1, 5], 0.5))
+
+    def test_fully_grounded_run_reports_perfect_precision(self):
+        results = [self._section([self._fact("f1"), self._fact("f2", page=2)])]
+        synthesis = {
+            "global_answers": [
+                self._answer("Q1", "一个句子的回答。", ["f1"]),
+                self._answer("Q2", "另一个回答。", ["f1", "f2"], pages=[1, 2]),
+            ]
+        }
+
+        m = run_evidence_metrics(results, synthesis)
+
+        self.assertEqual(2, m["fact_count"])
+        self.assertEqual(1.0, m["citation_precision"])
+        self.assertEqual(0.0, m["unsupported_claim_rate"])
+        self.assertEqual(2, m["answers_with_evidence"])
+        self.assertEqual(2, m["answers_with_sufficient_evidence"])
+        self.assertEqual(1, m["min_cited_facts"])
+        self.assertEqual(2, m["max_cited_facts"])
+
+    def test_answer_without_evidence_is_counted_as_insufficient(self):
+        results = [self._section([self._fact("f1")])]
+        synthesis = {
+            "global_answers": [
+                self._answer("Q1", "有据。", ["f1"]),
+                self._answer("Q2", "证据不足", []),
+            ]
+        }
+
+        m = run_evidence_metrics(results, synthesis)
+
+        self.assertEqual(1, m["answers_with_evidence"])
+        self.assertEqual(1, m["answers_with_sufficient_evidence"])
+        self.assertEqual(0, m["min_cited_facts"])
+        self.assertFalse(m["per_answer"][1]["sufficient_evidence"])
+
+    def test_citation_precision_drops_when_an_id_does_not_resolve(self):
+        results = [self._section([self._fact("f1")])]
+        synthesis = {
+            "global_answers": [
+                self._answer("Q1", "回答。", ["f1", "f-ghost"]),
+            ]
+        }
+
+        m = run_evidence_metrics(results, synthesis)
+
+        self.assertEqual(0.5, m["citation_precision"])
+        self.assertEqual(0.5, m["per_answer"][0]["citation_resolvable_rate"])
+        self.assertEqual(2, m["per_answer"][0]["cited_fact_count"])
+        self.assertEqual(1, m["per_answer"][0]["resolvable_fact_count"])
+
+    def test_unsupported_claim_rate_is_per_sentence(self):
+        results = [self._section([self._fact("f1")])]
+        synthesis = {
+            "global_answers": [
+                self._answer("Q1", "有据。无据甲。无据乙。", ["f1"], unsupported=["无据甲。", "无据乙。"]),
+            ]
+        }
+
+        m = run_evidence_metrics(results, synthesis)
+
+        self.assertEqual(3, m["per_answer"][0]["sentence_count"])
+        self.assertEqual(1, m["per_answer"][0]["supported_sentence_count"])
+        self.assertEqual(2, m["total_unsupported_claims"])
+        self.assertAlmostEqual(2 / 3, m["per_answer"][0]["unsupported_claim_rate"], places=4)
+
+    def test_ungrounded_facts_are_not_evidence(self):
+        results = [self._section([self._fact("f1", grounded=False)])]
+        synthesis = {"global_answers": [self._answer("Q1", "回答。", ["f1"])]}
+
+        m = run_evidence_metrics(results, synthesis)
+
+        self.assertEqual(0, m["fact_count"])       # not reachable as evidence
+        self.assertEqual(0.0, m["citation_precision"])
+
+    def test_metric_and_table_facts_count_as_reachable_evidence(self):
+        section = self._section([])
+        section["metric_facts"] = [self._fact("m1")]
+        section["table_facts"] = [{**self._fact("t1"), "kind": "metric"}]
+        results = [section]
+        synthesis = {"global_answers": [self._answer("Q1", "回答。", ["m1", "t1"])]}
+
+        m = run_evidence_metrics(results, synthesis)
+
+        self.assertEqual(2, m["fact_count"])
+        self.assertEqual(1.0, m["citation_precision"])
+
+    def test_handles_a_run_without_document_synthesis(self):
+        results = [self._section([self._fact("f1")])]
+
+        m = run_evidence_metrics(results, None)
+
+        self.assertEqual(0, m["answer_count"])
+        self.assertEqual(0, m["answers_with_evidence"])
+        self.assertEqual(0.0, m["citation_precision"])
+        self.assertEqual([], m["per_answer"])
+
+    def test_accepts_a_model_instance_as_well_as_a_dict(self):
+        results = [self._section([self._fact("f1")])]
+        model = DocumentSynthesis(
+            title="T",
+            executive_summary="s",
+            research_question="q",
+            methods=[], datasets=[], metrics=[], key_findings=[],
+            limitations=[], future_work=[], contradictions=[],
+            global_answers=[
+                GlobalAnswer(
+                    question=question,
+                    answer="回答。",
+                    source_fact_ids=["f1"],
+                    source_sections=["s1"],
+                    source_pages=[1],
+                    confidence=0.8,
+                )
+                for question in GLOBAL_QUESTIONS
+            ],
+        )
+
+        m = run_evidence_metrics(results, model)
+
+        self.assertEqual(10, m["answer_count"])
+        self.assertEqual(10, m["answers_with_evidence"])
+        self.assertEqual(1.0, m["citation_precision"])
+
+
+    def test_report_writes_a_readable_table_for_an_existing_run(self):
+        # The dev loop needs to recompute metrics over a stored run without paying
+        # for another API pass, so this path must work from JSON alone.
+        results = [self._section([self._fact("f1")])]
+        synthesis = {"global_answers": [self._answer("Q1", "回答。", ["f1"])]}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "run.json"
+            path.write_text(
+                json.dumps({"sections": results, "document_synthesis": synthesis},
+                           ensure_ascii=False),
+                encoding="utf-8",
+            )
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                metrics = report_evidence_metrics(path)
+            output = buffer.getvalue()
+
+        self.assertEqual(1, metrics["answer_count"])
+        self.assertIn("citation_precision=1.0", output)
+        self.assertIn("provenance metrics", output)
+
+    def test_report_rejects_a_missing_file(self):
+        with self.assertRaises(FileNotFoundError):
+            report_evidence_metrics("does-not-exist.json")
 
 
 class UtilityTests(unittest.TestCase):

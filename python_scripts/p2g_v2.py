@@ -2111,6 +2111,164 @@ def _build_fact_index(evidence: list[dict]) -> dict[str, dict]:
     }
 
 
+# --- Verifiable-extraction metrics -----------------------------------------
+# Provenance metrics for the understanding layer, computed from a finished run so
+# quality is measurable and regressible instead of eyeballed. Every quantity here
+# is deterministic: no model call, no judgement, reproducible run to run.
+#
+# Scope note: `unsupported_claim_rate` is the sentence-level claim audit. It
+# measures grounding (is each sentence backed by a cited fact), NOT relevance (does
+# the answer address the question). An answer can be fully grounded and still not
+# answer its question -- that failure mode needs a benchmark, and is deliberately
+# out of scope here.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。．！？!?；;])\s*|(?<=\.)\s+")
+
+
+def _answer_sentences(text: str) -> list[str]:
+    """Sentences of an answer, ignoring the bare insufficient-evidence marker."""
+    stripped = (text or "").strip()
+    if not stripped or stripped == "证据不足":
+        return []
+    return [part.strip() for part in _SENTENCE_SPLIT_RE.split(stripped) if part.strip()]
+
+
+def _supported_sentence_count(unsupported: list[str], sentence_count: int) -> int:
+    """Sentences with evidence, derived from the audited unsupported list.
+
+    `unsupported_claims` holds the offending sentences (not per-sentence flags),
+    so the supported count is the remainder, floored at zero because that list can
+    also carry a whole-answer entry injected by `_apply_answer_provenance`.
+    """
+    return max(0, sentence_count - len(unsupported))
+
+
+def _evidence_supports(fact: dict, num_cited: int) -> bool:
+    """True when the cited fact carries enough evidence to count as support.
+
+    One citing fact is enough for a single-sentence answer, but a multi-sentence
+    answer needs either the same number of facts or at least one fact rich enough
+    to back more than one claim (a long statement or a long verbatim quote).
+    """
+    if num_cited <= 1:
+        return True
+    if num_cited >= 2:
+        return True
+    statement = str(fact.get("statement", ""))
+    quote = str(fact.get("source_quote", ""))
+    return len(statement) >= 40 or len(quote) >= 80
+
+
+def _answer_metrics(answer: dict, fact_index: dict[str, dict]) -> dict:
+    """Deterministic provenance metrics for one global answer."""
+    answer_text = str(answer.get("answer", ""))
+    unsupported = [str(item) for item in (answer.get("unsupported_claims") or [])]
+    sentences = _answer_sentences(answer_text)
+    sentence_count = len(sentences)
+    supported = _supported_sentence_count(unsupported, sentence_count)
+
+    cited_ids = [str(entry) for entry in (answer.get("source_fact_ids") or []) if entry]
+    resolved = [fact_id for fact_id in cited_ids if fact_id in fact_index]
+    # `_apply_answer_provenance` already drops ids missing from the index, so this
+    # is near 1.0 by construction in a normal run. It is reported anyway: a drop
+    # means the output was assembled outside the normal pipeline.
+    resolvable = (len(resolved) / len(cited_ids)) if cited_ids else 0.0
+
+    support = sum(
+        1
+        for fact_id in resolved
+        if _evidence_supports(fact_index[fact_id], sentence_count)
+    )
+    pages = {int(page) for page in (answer.get("source_pages") or [])}
+
+    return {
+        "question": str(answer.get("question", "")),
+        "cited_fact_count": len(cited_ids),
+        "resolvable_fact_count": len(resolved),
+        "citation_resolvable_rate": round(resolvable, 4),
+        "unsupported_claim_count": len(unsupported),
+        "sentence_count": sentence_count,
+        "supported_sentence_count": supported,
+        "unsupported_claim_rate": (
+            round(len(unsupported) / sentence_count, 4) if sentence_count else 0.0
+        ),
+        "sufficient_evidence": bool(cited_ids) and support > 0,
+        "distinct_source_pages": len(pages),
+    }
+
+
+def _quantile(values: list[int], fraction: float) -> int:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round(fraction * (len(ordered) - 1)))))
+    return int(ordered[index])
+
+
+def run_evidence_metrics(
+    section_results: list[dict], document_synthesis: object = None
+) -> dict:
+    """Provenance metrics for a finished run.
+
+    Accepts what `_run` already has in hand: the per-section results plus the
+    document synthesis (a `DocumentSynthesis` model or its dumped dict), so this
+    adds no new coupling and no extra model calls.
+    """
+    if hasattr(document_synthesis, "model_dump"):
+        document_synthesis = document_synthesis.model_dump()
+    synthesis = document_synthesis if isinstance(document_synthesis, dict) else {}
+    answers = [
+        answer
+        for answer in (synthesis.get("global_answers") or [])
+        if isinstance(answer, dict)
+    ]
+
+    # Facts reachable as evidence: every grounded fact the sections produced,
+    # across all shapes the pipeline emits.
+    fact_index: dict[str, dict] = {}
+    for result in section_results:
+        for extraction in result.get("extractions") or []:
+            for fact in extraction.get("facts") or []:
+                if fact.get("grounded") and fact.get("fact_id"):
+                    fact_index[str(fact["fact_id"])] = fact
+        for key in ("table_facts", "detected_facts", "metric_facts"):
+            for fact in result.get(key) or []:
+                if fact.get("fact_id") and fact.get("grounded", True):
+                    fact_index[str(fact["fact_id"])] = fact
+
+    per_answer = [_answer_metrics(answer, fact_index) for answer in answers]
+    # Quantiles span every answer, including zero-evidence ones: excluding them
+    # would hide the very case the metric exists to catch (an answer that cited
+    # nothing would vanish from min/median/max instead of pulling min to 0).
+    counts = [item["cited_fact_count"] for item in per_answer]
+    total_cited = sum(item["cited_fact_count"] for item in per_answer)
+    total_resolved = sum(item["resolvable_fact_count"] for item in per_answer)
+    total_unsupported = sum(item["unsupported_claim_count"] for item in per_answer)
+    total_sentences = sum(item["sentence_count"] for item in per_answer)
+
+    return {
+        "fact_count": len(fact_index),
+        "answer_count": len(per_answer),
+        "answers_with_evidence": sum(
+            1 for item in per_answer if item["cited_fact_count"]
+        ),
+        "answers_with_sufficient_evidence": sum(
+            1 for item in per_answer if item["sufficient_evidence"]
+        ),
+        "citation_precision": (
+            round(total_resolved / total_cited, 4) if total_cited else 0.0
+        ),
+        "unsupported_claim_rate": (
+            round(total_unsupported / total_sentences, 4) if total_sentences else 0.0
+        ),
+        "median_cited_facts": _quantile(counts, 0.5),
+        "min_cited_facts": _quantile(counts, 0.0),
+        "max_cited_facts": _quantile(counts, 1.0),
+        "total_cited_facts": total_cited,
+        "total_unsupported_claims": total_unsupported,
+        "per_answer": per_answer,
+    }
+
+
 def _collect_source_fact_ids(items: list[dict]) -> set[str]:
     ids: set[str] = set()
     for item in items:
@@ -3887,8 +4045,47 @@ def _load_env_file() -> None:
         load_dotenv(env_path, override=False)
 
 
+def report_evidence_metrics(output_path: str | Path) -> dict:
+    """Print (and return) provenance metrics for an existing run output.
+
+    Supports the dev loop: metrics can be recomputed over a stored run without
+    paying for another full API pass, which is what makes them usable as a
+    regression gate.
+    """
+    path = Path(output_path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    metrics = run_evidence_metrics(
+        data.get("sections") or [], data.get("document_synthesis")
+    )
+    print(f"# provenance metrics: {path}")
+    print(
+        f"facts={metrics['fact_count']} answers={metrics['answer_count']} "
+        f"with_evidence={metrics['answers_with_evidence']} "
+        f"sufficient={metrics['answers_with_sufficient_evidence']} "
+        f"citation_precision={metrics['citation_precision']} "
+        f"unsupported_rate={metrics['unsupported_claim_rate']} "
+        f"cited(min/median/max)={metrics['min_cited_facts']}/"
+        f"{metrics['median_cited_facts']}/{metrics['max_cited_facts']}"
+    )
+    print(f"\n{'#':>2} {'cited':>5} {'resolv':>6} {'suff':>5} {'sent':>4} "
+          f"{'unsup':>5} {'pages':>5}  question")
+    for index, item in enumerate(metrics["per_answer"], 1):
+        print(
+            f"{index:>2} {item['cited_fact_count']:>5} "
+            f"{item['resolvable_fact_count']:>6} "
+            f"{str(item['sufficient_evidence']):>5} "
+            f"{item['sentence_count']:>4} {item['unsupported_claim_count']:>5} "
+            f"{item['distinct_source_pages']:>5}  {item['question']}"
+        )
+    return metrics
+
+
 async def _run(args: argparse.Namespace) -> None:
     _load_env_file()
+    if not args.pdf:
+        raise ValueError("a PDF path is required (or use --metrics on an existing run output)")
     root, sections = preprocess_pdf(args.pdf, args.include_back_matter)
     if args.section:
         terms = [term.lower() for term in args.section]
@@ -3932,7 +4129,12 @@ async def _run(args: argparse.Namespace) -> None:
             results.append(await pipeline.process_section(section, args.max_tokens, args.overlap_tokens))
             output.write_text(
                 json.dumps(
-                    {"sections": results, "document_synthesis": None, "stats": pipeline.stats()},
+                    {
+                        "sections": results,
+                        "document_synthesis": None,
+                        "stats": pipeline.stats(),
+                        "evidence_metrics": run_evidence_metrics(results, None),
+                    },
                     ensure_ascii=False,
                     indent=2,
                 ),
@@ -3942,17 +4144,25 @@ async def _run(args: argparse.Namespace) -> None:
         if len(results) > 1 and not args.skip_document_reduce:
             print(f"[Global] reducing {len(results)} sections")
             document_synthesis = await pipeline.synthesize_document(results, args.reduce_max_tokens)
+        metrics = run_evidence_metrics(results, document_synthesis)
         output.write_text(
             json.dumps(
                 {
                     "sections": results,
                     "document_synthesis": document_synthesis.model_dump() if document_synthesis else None,
                     "stats": pipeline.stats(),
+                    "evidence_metrics": metrics,
                 },
                 ensure_ascii=False,
                 indent=2,
             ),
             encoding="utf-8",
+        )
+        print(
+            "[Metrics] facts={fact_count} answers={answer_count} "
+            "with_evidence={answers_with_evidence} sufficient={answers_with_sufficient_evidence} "
+            "citation_precision={citation_precision} unsupported_rate={unsupported_claim_rate} "
+            "median_cited={median_cited_facts}".format(**metrics)
         )
     finally:
         await pipeline.close()
@@ -3960,7 +4170,7 @@ async def _run(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="P2G V2 long-document pipeline")
-    parser.add_argument("pdf")
+    parser.add_argument("pdf", nargs="?", default="")
     parser.add_argument("--output", default="p2g_v2_output.json")
     parser.add_argument("--memory-db", default="p2g_v2_memory.sqlite3")
     parser.add_argument("--cache-db", default="p2g_v2_cache.sqlite3")
@@ -3988,7 +4198,18 @@ def main() -> None:
     parser.add_argument("--reduce-max-output-tokens", type=int, default=2200)
     parser.add_argument("--document-max-output-tokens", type=int, default=3000)
     parser.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
-    asyncio.run(_run(parser.parse_args()))
+    parser.add_argument(
+        "--metrics",
+        metavar="RUN_OUTPUT_JSON",
+        default="",
+        help="Print provenance metrics for an existing run output and exit "
+        "(no PDF or API key needed).",
+    )
+    args = parser.parse_args()
+    if args.metrics:
+        report_evidence_metrics(args.metrics)
+        return
+    asyncio.run(_run(args))
 
 
 if __name__ == "__main__":
