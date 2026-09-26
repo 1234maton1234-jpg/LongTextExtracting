@@ -57,6 +57,7 @@ from p2g_v2 import (  # noqa: E402
     deduplicate_sections,
     estimate_tokens,
     extract_table_facts,
+    extract_metric_facts,
     fallback_document_overview,
     fallback_group_synthesis,
     flatten_sections,
@@ -71,6 +72,193 @@ from p2g_v2 import (  # noqa: E402
     batch_by_token_budget,
     build_section_evidence,
 )
+
+
+class MetricFactExtractionTests(unittest.TestCase):
+    """Prose metric recovery: `kind="metric"` must not depend on markdown tables.
+
+    Regression guard for the defect where a PDF yielding no pipe tables left the
+    metric pool empty, so "使用了哪些评价指标？" answered with an unrelated but
+    grounded definition sentence.
+    """
+
+    def _section(self, text, page_start=1, page_end=None, page_texts=None, section_id="node-metric"):
+        return HeadingNode(
+            id=section_id,
+            title="评价指标",
+            level=1,
+            page_start=page_start,
+            page_end=page_end if page_end is not None else page_start,
+            subtree_page_end=page_end if page_end is not None else page_start,
+            text=text,
+            page_texts=page_texts if page_texts is not None else [
+                PageMarkdown(page=page_start, text=text)
+            ],
+        )
+
+    def test_recovers_metric_reported_with_percentage(self):
+        section = self._section(
+            "Evaluation on a VLN benchmark shows our RCM model outperforms "
+            "previous methods by 10% on SPL and achieves state-of-the-art performance."
+        )
+
+        facts = extract_metric_facts(section)
+
+        self.assertEqual(1, len(facts))
+        self.assertEqual("metric", facts[0].kind)
+        self.assertEqual("SPL", facts[0].concept)
+        self.assertTrue(facts[0].grounded)
+        self.assertIn("10%", facts[0].statement)
+        self.assertEqual(1, facts[0].page)
+
+    def test_recovers_chinese_metric(self):
+        section = self._section("实验采用准确率和召回率作为评价指标，准确率达到 91.4%。")
+
+        facts = extract_metric_facts(section)
+
+        self.assertTrue(facts)
+        self.assertEqual("metric", facts[0].kind)
+        self.assertIn(facts[0].concept, {"准确率", "召回率", "评价指标"})
+        self.assertTrue(all(fact.grounded for fact in facts))
+
+    def test_recovers_benchmark_comparison_without_named_metric(self):
+        # "outperforms others by 6% on the 2022 OK-VQA open-domain multimodal task"
+        # names no metric, but it is still the quantitative evidence the metric
+        # question needs.
+        section = self._section(
+            "We introduce the Knowledge Augmented Transformer (KAT), which "
+            "outperforms others by 6% on the 2022 OK-VQA open-domain multimodal task."
+        )
+
+        facts = extract_metric_facts(section)
+
+        self.assertEqual(1, len(facts))
+        self.assertEqual("metric", facts[0].kind)
+        self.assertIn("6%", facts[0].statement)
+
+    def test_ignores_bare_mention_without_evidence(self):
+        # No number, no evaluation framing: not evidence that the metric was used.
+        section = self._section(
+            "Common uses for retrieving and analysing data must be respectful of all users."
+        )
+
+        self.assertEqual([], extract_metric_facts(section))
+
+    def test_ignores_english_copula_and_geographic_map(self):
+        # "is" and "map" are the worst false-positive generators in real papers.
+        section = self._section(
+            "The player begins by running around the map, passing through different "
+            "checkpoints, and the agent is able to interact with several capture points."
+        )
+
+        self.assertEqual([], extract_metric_facts(section))
+
+    def test_ignores_acronym_homonym_without_numeric_evidence(self):
+        # "MAE" here is the masked autoencoder, not mean absolute error.
+        section = self._section(
+            "We use a 12-layer ViT initialized from MAE (He et al., 2022) "
+            "(ImageNet-1K without labels) as our backbone."
+        )
+
+        self.assertEqual([], extract_metric_facts(section))
+
+    def test_ambiguous_metric_accepted_when_value_present(self):
+        section = self._section("Our model reaches an mIoU of 0.82 on the test set.")
+
+        facts = extract_metric_facts(section)
+
+        self.assertTrue(facts)
+        self.assertEqual("miou", facts[0].concept.lower())
+
+    def test_ignores_metric_word_used_as_ordinary_prose(self):
+        # "accuracy" here is ordinary prose about accuracy, not a reported metric:
+        # an evaluation verb alone must not admit it.
+        section = self._section(
+            "To enhance the accuracy of video descriptions, we employ GPT-4V to "
+            "caption frames, while audio and its transcriptions are sourced elsewhere."
+        )
+
+        self.assertEqual([], extract_metric_facts(section))
+
+    def test_accepts_enumerated_metric_list_without_numbers(self):
+        section = self._section(
+            "Evaluation metrics include accuracy, precision, recall and F1."
+        )
+
+        facts = extract_metric_facts(section)
+
+        # One fact per sentence, named after the longest matched term, so that a
+        # dense metric list cannot flood the evidence pool.
+        self.assertEqual(1, len(facts))
+        self.assertEqual("metric", facts[0].kind)
+        self.assertEqual("precision", facts[0].concept.lower())
+        self.assertIn("precision", facts[0].statement)
+
+    def test_does_not_match_metric_names_inside_longer_tokens(self):
+        # "recalled" must not fire "recall"; "f10" must not fire "f1".
+        section = self._section(
+            "The agent recalled the f10 configuration from memory last week."
+        )
+
+        self.assertEqual([], extract_metric_facts(section))
+
+    def test_deduplicates_by_term_and_respects_cap(self):
+        sentence = " ".join(
+            f"We report accuracy of {value}.0% on benchmark {index}."
+            for index, value in enumerate(range(60, 75))
+        )
+        section = self._section(sentence)
+
+        facts = extract_metric_facts(section, max_facts=3)
+
+        self.assertLessEqual(len(facts), 3)
+        concepts = [fact.concept.lower() for fact in facts]
+        self.assertEqual(len(concepts), len(set(concepts)))
+        self.assertEqual(len({fact.fact_id for fact in facts}), len(facts))
+
+    def test_fact_ids_are_stable_across_calls(self):
+        text = "Evaluation on the VLN benchmark reports 10% on SPL."
+        first = extract_metric_facts(self._section(text))
+        second = extract_metric_facts(self._section(text))
+
+        self.assertEqual(
+            [fact.fact_id for fact in first], [fact.fact_id for fact in second]
+        )
+
+    def test_metric_facts_reach_question_retrieval_without_tables(self):
+        # End-to-end through the evidence builder: a table-free section must still
+        # put metric evidence in front of the "评价指标" route.
+        text = (
+            "Evaluation on a VLN benchmark dataset shows that our RCM model "
+            "significantly outperforms previous methods by 10% on SPL."
+        )
+        section = self._section(text)
+        section_dict = section.model_dump(exclude={"children"})
+        result = {
+            "section": section_dict,
+            "extractions": [{"summary": "s", "facts": []}],
+            "table_facts": [],
+            "synthesis": {
+                "summary": "s",
+                "core_concepts": [],
+                "key_findings": [],
+                "source_pages": [1],
+                "title": "t",
+            },
+        }
+
+        evidence = build_section_evidence(result)
+        metric_evidence = [f for f in evidence["facts"] if f["kind"] == "metric"]
+        self.assertTrue(metric_evidence)
+
+        catalog = [
+            {**fact, "section_title": evidence["title"]} for fact in evidence["facts"]
+        ]
+        _, allowed = build_question_request(
+            "使用了哪些评价指标？", catalog, [], max_tokens=600
+        )
+
+        self.assertIn(metric_evidence[0]["fact_id"], allowed)
 
 
 class HeadingTreeTests(unittest.TestCase):
@@ -2439,8 +2627,12 @@ class RequestRetryTests(unittest.IsolatedAsyncioTestCase):
         visible via FakeCompletions."""
         pipeline, completions = await self._make_recovery_pipeline(scripted_responses)
         pipeline.flash_model = "flash"
-        pipeline.pro_model = None
+        # Keep the pro model distinct from None: adding metric facts makes a
+        # section carry more than one extraction, which routes the section reduce
+        # to the pro model.
+        pipeline.pro_model = "pro"
         pipeline.extract_max_output_tokens = 4096
+        pipeline.reduce_max_output_tokens = 2200
         self._extract_dir = tempfile.mkdtemp()
         pipeline.cache = ResultCache(Path(self._extract_dir) / "cache.sqlite3")
         pipeline.memory = ConceptMemory(Path(self._extract_dir) / "memory.sqlite3")
@@ -2512,6 +2704,74 @@ class RequestRetryTests(unittest.IsolatedAsyncioTestCase):
         system_prompt = completions.kwargs[0]["messages"][0]["content"]
         self.assertIn("最多输出 20 条", system_prompt)
         self.assertIn("source_quote 尽量简短", system_prompt)
+        await self._cleanup_extract(pipeline)
+
+    async def test_extract_chunk_prompt_requests_prose_metrics(self):
+        # The prompt must ask for kind="metric" explicitly and say that metrics in
+        # body prose count, not just table rows. Otherwise the LLM never emits the
+        # kind and the metric route depends solely on markdown table parsing.
+        valid = {"summary": "摘要", "facts": [], "new_concepts": []}
+        pipeline, completions = await self._make_extract_pipeline(
+            [("stop", json.dumps(valid, ensure_ascii=False))]
+        )
+        section = HeadingNode(
+            id="s1", title="方法", level=2,
+            page_start=1, page_end=1, subtree_page_end=1,
+        )
+        chunk = TextChunk(index=0, text="原文", token_estimate=10)
+
+        await pipeline.extract_chunk(section, chunk)
+
+        system_prompt = completions.kwargs[0]["messages"][0]["content"]
+        self.assertIn("metric", system_prompt)
+        self.assertIn("正文叙述", system_prompt)
+        self.assertIn("准确率", system_prompt)
+        await self._cleanup_extract(pipeline)
+
+    async def test_process_section_adds_prose_metric_facts(self):
+        # Full section flow: the LLM contributes no metric facts, yet the section
+        # result must still carry deterministic prose metric facts, and the
+        # evidence builder must surface them as kind="metric".
+        metric_text = (
+            "Evaluation on a VLN benchmark dataset shows that our RCM model "
+            "significantly outperforms previous methods by 10% on SPL."
+        )
+        valid = {"summary": "摘要", "facts": [], "new_concepts": []}
+        synthesis = {
+            "title": "结果",
+            "summary": "章节摘要",
+            "core_concepts": [],
+            "key_findings": [],
+            "source_pages": [1],
+        }
+        pipeline, _ = await self._make_extract_pipeline(
+            [
+                ("stop", json.dumps(valid, ensure_ascii=False)),
+                ("stop", json.dumps(synthesis, ensure_ascii=False)),
+            ]
+        )
+        section = HeadingNode(
+            id="s-metric", title="结果", level=2,
+            page_start=1, page_end=1, subtree_page_end=1,
+            text=metric_text,
+            page_texts=[PageMarkdown(page=1, text=metric_text)],
+        )
+
+        result = await pipeline.process_section(section)
+
+        metric_facts = result["metric_facts"]
+        self.assertEqual(1, len(metric_facts))
+        self.assertEqual("SPL", metric_facts[0]["concept"])
+        self.assertEqual("metric", metric_facts[0]["kind"])
+        # The synthetic extraction must be visible to the section reduce too.
+        self.assertEqual(2, len(result["extractions"]))
+        self.assertIn("确定性抽取的评价指标事实", result["extractions"][-1]["summary"])
+
+        evidence = build_section_evidence(result)
+        metric_evidence = [f for f in evidence["facts"] if f["kind"] == "metric"]
+        self.assertEqual(1, len(metric_evidence))
+        self.assertEqual(1, metric_evidence[0]["page"])
+        self.assertTrue(metric_evidence[0]["grounded"])
         await self._cleanup_extract(pipeline)
 
     async def _make_reduce_pipeline(self, scripted_responses):

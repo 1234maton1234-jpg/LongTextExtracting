@@ -38,7 +38,7 @@ PICTURE_TEXT_BLOCK_RE = re.compile(
 )
 IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 MARK_TAG_RE = re.compile(r"</?mark\b[^>]*>", re.IGNORECASE)
-EXTRACTION_PROMPT_VERSION = "v2.9"
+EXTRACTION_PROMPT_VERSION = "v2.10"
 REDUCE_PROMPT_VERSION = "v2.9"
 GROUP_PROMPT_VERSION = "v2.11"
 DOCUMENT_PROMPT_VERSION = "v2.17"
@@ -1349,6 +1349,251 @@ def extract_table_facts(section: HeadingNode) -> list[TableFact]:
     return list({fact.fact_id: fact for fact in facts}.values())
 
 
+# --- Prose metric recovery -------------------------------------------------
+# `kind="metric"` used to be produced only by `extract_table_facts`, which needs
+# pymupdf4llm to emit markdown pipe tables. A PDF that yields no tables therefore
+# had an empty metric pool, and "使用了哪些评价指标？" degraded into citing an
+# unrelated definition fact: a sentence that IS grounded in the source (so the
+# claim auditor passes it) but does not answer the question.
+# `extract_metric_facts` recovers evaluation metrics straight from prose so the
+# metric route always has relevant evidence.
+#
+# Two risk classes, because metric names collide with ordinary words and with
+# other technical terms. Measured on a real 75-page survey:
+#   * Tier A names are unambiguous ("bleu", "accuracy", "召回率") -- a mention is
+#     enough, modulo the evidence gate below.
+#   * Tier B names collide with homonyms or acronyms ("mae" = masked autoencoder,
+#     "iou"/"map" used about geometry, "mse" inside other identifiers) -- these
+#     additionally require explicit numeric evidence.
+#   * Excluded entirely: "is" (264 hits, the English copula), "oracle", "acc",
+#     "cer", "der", "kappa", "ap50" -- pure false-positive generators.
+_METRIC_TERMS_UNAMBIGUOUS: tuple[str, ...] = (
+    "accuracy", "balanced accuracy", "precision", "recall",
+    "f1-score", "f1 score", "micro-f1", "macro-f1", "f1",
+    "mcc", "matthews correlation", "auroc", "auprc", "top-1 accuracy",
+    "top-5 accuracy", "bleu", "rouge", "meteor", "cider", "spice", "bertscore",
+    "perplexity", "ndcg", "mrr", "mean average precision", "success rate",
+    "psnr", "ssim", "lpips", "clip score", "rmse", "miou",
+    "jaccard", "dice coefficient", "wer", "word error rate",
+    "likert", "mos", "win rate", "human evaluation", "human rating",
+    # Chinese counterparts (CJK matching ignores punctuation/whitespace)
+    "准确率", "精确率", "精确度", "召回率", "查准率", "查全率", "错误率",
+    "f1值", "f1分数", "宏平均", "微平均", "混淆矩阵", "平均精度",
+    "皮尔逊", "相关系数", "斯皮尔曼", "决定系数", "均方误差", "平均绝对误差",
+    "交并比", "成功率", "导航误差", "困惑度", "评价指标", "评估指标",
+)
+
+_METRIC_TERMS_AMBIGUOUS: tuple[str, ...] = (
+    "mae", "mse", "iou", "map", "map@50", "fid", "spl",
+)
+
+# Compiling the full alternation once keeps `_metric_terms_in` linear in the
+# number of terms without re-scanning the sentence per term.
+_METRIC_TERM_RE = re.compile(
+    "|".join(
+        re.escape(term)
+        for term in sorted(
+            (*_METRIC_TERMS_UNAMBIGUOUS, *_METRIC_TERMS_AMBIGUOUS),
+            key=len,
+            reverse=True,
+        )
+    ),
+    re.IGNORECASE,
+)
+_AMBIGUOUS_KEYS = {term.lower() for term in _METRIC_TERMS_AMBIGUOUS}
+
+# Evidence gate. A metric mention alone is not evidence that the document *used*
+# the metric, so a stronger signal must accompany it:
+#   * a percentage anywhere in the sentence ("10% on SPL") -- the strongest and
+#     most common reporting signal;
+#   * "<metric> of <number>" / "<metric> = <number>" ("F1 of 0.82");
+#   * the metric appearing in an enumerated metric list ("metrics include
+#     accuracy, precision, and F1").
+# A bare number is deliberately NOT sufficient: "12-layer ViT ... initialized
+# from MAE (He et al., 2022)" would otherwise enter the metric pool. A bare
+# evaluation verb is NOT sufficient either: "to enhance the accuracy of video
+# descriptions" is ordinary prose about accuracy, not a reported metric.
+_PERCENT_EVIDENCE_RE = re.compile(r"\d\s*%")
+_METRIC_VALUE_RE = re.compile(
+    r"(?i)(?:of|=|:|达到|为)\s*[-+]?\d+(?:\.\d+)?\s*%?"
+)
+_METRIC_ENUM_RE = re.compile(
+    r"(?i)(?:metric[s]?\s+(?:include|includes|are|were|used|such as)"
+    r"|evaluat\w*\s+(?:with|using|by)"
+    r"|measur\w*\s+(?:with|using|by)"
+    r"|report\w*\s+(?:with|using|by)"
+    r"|我们?(?:采用|使用|选取)|评价指标(?:包括|为|采用)|评估指标(?:包括|为)"
+    r"|指标包括)"
+)
+
+# Sentence boundaries: ASCII terminators always break; a CJK terminator breaks
+# only when it is not a decimal point between digits.
+_SENTENCE_SPLIT_RE = re.compile(
+    r"(?<=[!?])\s+|(?<=\.)\s+|(?<=[。！？；;])(?!\d)"
+)
+
+
+def _metric_terms_in(text: str) -> list[str]:
+    """Evaluation-metric terms mentioned in `text`, longest first (so
+    "f1-score" wins over "f1"), deduplicated case-insensitively."""
+    found: dict[str, str] = {}
+    for match in _METRIC_TERM_RE.finditer(text):
+        term = match.group(0)
+        key = term.lower()
+        if term[0].isascii() and term[-1].isascii():
+            # Whole-word match only: "recall" must not fire on "recalled",
+            # "f1" must not fire on "f10".
+            before = text[match.start() - 1] if match.start() else ""
+            after = text[match.end()] if match.end() < len(text) else ""
+            if (before.isalnum() and before.isascii()) or (
+                after.isalnum() and after.isascii()
+            ):
+                continue
+        found.setdefault(key, term)
+    return [term for _key, term in sorted(found.items(), key=lambda kv: (-len(kv[0]), kv[0]))]
+
+
+def _metric_evidence_ok(sentence: str) -> bool:
+    """True when the sentence reports or explicitly enumerates evaluation metrics."""
+    if _PERCENT_EVIDENCE_RE.search(sentence):
+        return True
+    if _METRIC_VALUE_RE.search(sentence):
+        return True
+    return bool(_METRIC_ENUM_RE.search(sentence))
+
+
+def _metric_statement(sentence: str, terms: list[str]) -> str:
+    """Chinese restatement of a metric-bearing source sentence. Numbers are kept
+    verbatim so a quantitative answer stays auditable against the source."""
+    numbers = re.findall(r"\d+(?:[.,]\d+)?\s*%?", sentence)
+    named = "、".join(terms[:5])
+    if numbers:
+        return f"原文使用了评价指标 {named}，并把数值结果记为 {'、'.join(numbers[:6])}。"
+    return f"原文使用了评价指标 {named}，作为该项工作的评估口径。"
+
+
+# Some evaluation sentences report a benchmark comparison without naming a
+# metric ("outperforms others by 6% on the 2022 OK-VQA open-domain multimodal
+# task"). Those are still exactly the quantitative evidence the metric question
+# needs, and the gate below is narrow enough not to admit unrelated percentages
+# such as "(6% of pretraining data)".
+_PERFORMANCE_CUE_RE = re.compile(
+    r"(?i)\b(outperform\w*|superior|better than|improve[sd]?|gain(?:s|ed)?|"
+    r"exceed\w*|higher than|lower than|reduc\w*|achiev\w*|beat(?:s|en)?)\b"
+    r"|优于|超过|提升|改进|降低|领先"
+)
+_BENCHMARK_CONTEXT_RE = re.compile(
+    r"(?i)\b(benchmark|dataset|task|leaderboard|baseline|state[- ]of[- ]the[- ]art|"
+    r"sota)\b|基准|数据集|评测|任务|排行榜"
+)
+# Concept label for benchmark-comparison facts that carry a number but name no
+# metric. Kept as a module constant so the producer and the statement builder
+# cannot drift apart.
+_PERFORMANCE_CONCEPT = "性能对比"
+
+
+def _metric_performance_claim(sentence: str) -> bool:
+    """True when a sentence makes a quantified performance claim against a task
+    or benchmark, even without naming the metric."""
+    return bool(
+        _PERCENT_EVIDENCE_RE.search(sentence)
+        and _PERFORMANCE_CUE_RE.search(sentence)
+        and _BENCHMARK_CONTEXT_RE.search(sentence)
+    )
+
+
+def _performance_statement(sentence: str) -> str:
+    numbers = re.findall(r"\d+(?:[.,]\d+)?\s*%?", sentence)
+    if numbers:
+        return f"原文给出了量化的性能对比结论，数值为 {'、'.join(numbers[:6])}。"
+    return "原文给出了量化的性能对比结论。"
+
+
+def _metric_fact_from_sentence(
+    sentence: str,
+    terms: list[str],
+    section: "HeadingNode",
+    page_texts: list[PageMarkdown],
+    confidence: float,
+) -> Fact | None:
+    text = section.text or ""
+    if not terms:
+        return None
+    quote = sentence[:400]
+    if not _quote_is_grounded(quote, text):
+        return None
+    statement = (
+        _performance_statement(sentence)
+        if terms == [_PERFORMANCE_CONCEPT]
+        else _metric_statement(sentence, terms)
+    )
+    fact = Fact(
+        concept=terms[0],
+        statement=statement,
+        kind="metric",
+        source_quote=quote,
+        page=section.page_start,
+        confidence=confidence,
+    )
+    fact.grounded = True
+    fact.page = _quote_page(quote, page_texts) or section.page_start
+    fact.fact_id = _stable_fact_id(section.id, fact)
+    return fact
+
+
+def extract_metric_facts(
+    section: "HeadingNode",
+    max_facts: int = 8,
+) -> list[Fact]:
+    """Deterministic `kind="metric"` facts recovered from a section's prose.
+
+    Each fact quotes a real sentence from the section, so `_quote_is_grounded`
+    accepts it and `_quote_page` can attribute a page. At most one fact per
+    distinct metric term per section, which keeps the metric pool small enough
+    that it cannot crowd out the other kinds during retrieval.
+    """
+    text = section.text or ""
+    if not text.strip():
+        return []
+    page_texts = section.page_texts or [PageMarkdown(page=section.page_start, text=text)]
+    facts: list[Fact] = []
+    seen_terms: set[str] = set()
+    claimed_performance = False
+    for sentence in (raw.strip() for raw in _SENTENCE_SPLIT_RE.split(text)):
+        if not sentence:
+            continue
+        terms = [term for term in _metric_terms_in(sentence) if term.lower() not in seen_terms]
+        if terms:
+            if not _metric_evidence_ok(sentence):
+                continue
+            # Tier B names colliding with acronyms/homonyms need a percentage or an
+            # explicit "metric of N" construction to count as real evidence.
+            if all(term.lower() in _AMBIGUOUS_KEYS for term in terms) and not (
+                _PERCENT_EVIDENCE_RE.search(sentence)
+                or _METRIC_VALUE_RE.search(sentence)
+            ):
+                continue
+            fact = _metric_fact_from_sentence(
+                sentence, terms, section, page_texts, confidence=0.75
+            )
+        elif not claimed_performance and _metric_performance_claim(sentence):
+            # One benchmark-comparison fact per section is enough; without the
+            # cap this channel would flood the metric pool on results-heavy papers.
+            claimed_performance = True
+            fact = _metric_fact_from_sentence(
+                sentence, [_PERFORMANCE_CONCEPT], section, page_texts, confidence=0.7
+            )
+        else:
+            continue
+        if fact is None:
+            continue
+        facts.append(fact)
+        seen_terms.update(term.lower() for term in terms)
+        if len(facts) >= max_facts:
+            break
+    return facts
+
+
 def _entity_keys(value: str) -> set[str]:
     normalized = _normalize_concept_text(value)
     words = re.findall(r"[A-Za-z]+", value)
@@ -1604,8 +1849,28 @@ def _compact_evidence_fact(fact: dict, section_id: str) -> dict:
     }
 
 
+def _metric_facts_from_result(result: dict) -> list[Fact]:
+    """Metric facts for a section result, computed from the stored section text.
+
+    `process_section` already persists `metric_facts`, but a result dict rebuilt
+    from an older output file (a resumed or hand-edited run) may not carry them,
+    so the section node is reconstructed and the deterministic extractor re-run.
+    Recomputation is safe because it is pure and keyed on the section id.
+    """
+    stored = result.get("metric_facts")
+    if stored is not None:
+        return [Fact.model_validate(item) for item in stored]
+    try:
+        node = HeadingNode(**result["section"])
+    except (KeyError, TypeError, ValidationError):
+        return []
+    return extract_metric_facts(node)
+
+
 def build_section_evidence(
-    result: dict, required_table_fact_ids: set[str] = frozenset()
+    result: dict,
+    required_table_fact_ids: set[str] = frozenset(),
+    metric_facts: list[Fact] | None = None,
 ) -> dict:
     section = result["section"]
     facts = []
@@ -1617,6 +1882,11 @@ def build_section_evidence(
             enriched["fact_id"] = enriched.get("fact_id") or _stable_fact_id(section["id"], enriched)
             enriched["section_id"] = section["id"]
             facts.append(_compact_evidence_fact(enriched, section["id"]))
+    for fact in (
+        metric_facts if metric_facts is not None else _metric_facts_from_result(result)
+    ):
+        if fact.grounded and fact.fact_id:
+            facts.append(_compact_evidence_fact(fact.model_dump(), section["id"]))
     table_facts = result.get("table_facts", [])
     salient_table_ids = {fact["fact_id"] for fact in table_facts if fact.get("bold")}
     salient_table_ids.update(required_table_fact_ids)
@@ -2921,7 +3191,8 @@ class LongDocumentPipeline:
 {"summary":"本块摘要","facts":[{"concept":"概念","statement":"事实","kind":"definition|formula|method|result|limitation|advantage|disadvantage|example|relation|classification|dataset|metric","source_quote":"原文逐字引用","page":1,"confidence":0.95}],"new_concepts":["概念"]}
 source_quote 必须是原文中的连续文本；不得补充原文没有的因果关系。直接逐字证据通常使用 0.8-1.0 的置信度，不要机械照抄示例值。
 statement 必须用中文概括原文语义：原文是英文时翻译成中文，只保留专有名词、指标名、模型名等原文术语，禁止整句照抄英文原文。
-每个块最多输出 20 条事实；候选超过 20 条时优先保留信息量最大、置信度最高的。source_quote 尽量简短（约 80 字以内），足以在原文中定位即可。"""
+每个块最多输出 20 条事实；候选超过 20 条时优先保留信息量最大、置信度最高的。source_quote 尽量简短（约 80 字以内），足以在原文中定位即可。
+kind 判定要点：文本提到用于评估该工作的指标（accuracy、precision、recall、F1、AUC、BLEU、ROUGE、METEOR、PSNR、SSIM、mIoU、RMSE、MAE、success rate、SPL、perplexity、准确率、召回率、F1 值、皮尔逊相关系数等）时，必须标为 metric；指标出现在正文叙述里（不限于表格）同样要抽取，concept 用指标名，statement 保留该指标对应的数值。仅当文本确实是评估口径时才用 metric，泛泛出现的普通词（如 "accuracy" 仅表示"准确性"）不要标 metric。"""
         user = json.dumps(
             {
                 "section": section.title,
@@ -3313,6 +3584,21 @@ source_fact_ids 必须来自 fact_catalog；章节和页码留空，由程序反
             page_texts=section.page_texts,
         )
         extractions = await asyncio.gather(*(self.extract_chunk(section, chunk) for chunk in chunks))
+        # Deterministic prose metric recovery. Table-derived metric facts need
+        # markdown tables from pymupdf4llm; when a PDF yields none, the metric pool
+        # is empty and "使用了哪些评价指标？" has nothing relevant to cite. Adding
+        # these as a synthetic extraction makes them visible to the section reduce,
+        # the evidence index, and the global-answer retrieval alike.
+        metric_facts = extract_metric_facts(section)
+        if metric_facts:
+            extractions = [
+                *extractions,
+                ChunkExtraction(
+                    summary=f"确定性抽取的评价指标事实（{len(metric_facts)} 条）",
+                    facts=metric_facts,
+                    new_concepts=[],
+                ),
+            ]
         table_facts = extract_table_facts(section)
         numeric_contradictions = detect_numeric_contradictions(section, table_facts)
         for extraction in extractions:
@@ -3330,6 +3616,7 @@ source_fact_ids 必须来自 fact_catalog；章节和页码留空，由程序反
             "chunks": [chunk.model_dump() for chunk in chunks],
             "extractions": [item.model_dump() for item in extractions],
             "table_facts": [fact.model_dump() for fact in table_facts],
+            "metric_facts": [fact.model_dump() for fact in metric_facts],
             "detected_facts": [
                 item.claim_fact.model_dump() for item in numeric_contradictions
             ],
