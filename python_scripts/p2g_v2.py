@@ -531,6 +531,26 @@ _FRONT_MATTER_TITLES = {
 }
 
 
+def _document_key(pdf_path: str | Path) -> str:
+    """Stable identity for a source document, used to scope concept memory.
+
+    Hashing the bytes (not the path) means the same paper keeps its memory when
+    moved or renamed, while a different paper can never inherit it. `--document-key`
+    overrides this when an explicit grouping is wanted.
+    """
+    path = Path(pdf_path)
+    digest = hashlib.sha1()
+    try:
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+    except OSError:
+        # Unreadable source: fall back to the name so scoping still separates
+        # documents instead of collapsing everything into one namespace.
+        digest.update(str(path).encode("utf-8"))
+    return f"doc-{digest.hexdigest()[:16]}"
+
+
 def _candidate_document_title(root: HeadingNode) -> str | None:
     """Deterministic document-title candidate from the heading tree.
 
@@ -892,7 +912,98 @@ def _concept_keys(name: str) -> set[str]:
     return keys
 
 
+_SCRIPT_RUN_RE = re.compile(r"[a-z0-9]+|[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
+# A space sitting between two CJK characters is a PDF extraction artefact, not a
+# real word break, so it must be removed before tokenising -- otherwise the alias
+# "支持向量机" can never match "支持 向量机".
+_CJK_GAP_RE = re.compile(
+    r"(?<=[\u3400-\u4dbf\u4e00-\u9fff\ufaff])\s+(?=[\u3400-\u4dbf\u4e00-\u9fff\ufaff])"
+)
+# Joins token runs in a matching haystack. It must not appear in real text and
+# must not be an ASCII word character, so the word-boundary test can treat it as
+# a boundary while still keeping tokens from being welded together.
+_RUN_SEPARATOR = "\x00"
+
+
+def _concept_runs(value: str) -> list[str]:
+    """Lowercased ASCII/CJK runs of `value`, with intra-CJK spaces dropped."""
+    normalized = _CJK_GAP_RE.sub("", unicodedata.normalize("NFKC", value).lower())
+    return _SCRIPT_RUN_RE.findall(normalized)
+
+
+def _tokenized_concept_text(value: str) -> str:
+    """Normalised text as script runs joined by a single space.
+
+    ``_normalize_concept_text`` strips every separator, which welds neighbouring
+    words together: "each agent acts" became "eachagentacts", so the alias
+    "agent" matched starting *inside* "each" and a word-boundary check then
+    rejected the whole string.
+    """
+    return " ".join(_concept_runs(value))
+
+
+def _alias_occurs_in(alias_key: str, normalized_text: str) -> bool:
+    """True when `alias_key` occurs as a whole token of `normalized_text`.
+
+    A plain substring test over the stripped normalization lets short aliases
+    match inside unrelated longer words. Measured on a real 1530-alias memory DB,
+    ordinary prose retrieved pure noise that was then injected into every
+    extraction prompt as `related_memory`: "HER" matched inside "other",
+    "Position" inside "composition", "Actions" inside "interactions", "map"
+    inside "checkpoint".
+
+    Matching therefore requires that the alias is not glued to an adjacent ASCII
+    word character, which is what makes "agent" safe against "agentopia".
+
+    The text is tokenised here via `_concept_runs`, so this function accepts raw
+    or pre-normalised input and cannot drift from `_tokenized_concept_text`.
+    """
+    if not alias_key:
+        return False
+    # Stored alias keys are normally already lowercased by `_normalize_concept_text`,
+    # but not guaranteed (an acronym alias can keep its case). The haystack is
+    # lowercased, so comparing without folding case silently drops those aliases --
+    # the real DB has the key 'AI' stored uppercase.
+    alias_key = unicodedata.normalize("NFKC", alias_key).lower()
+    # Collapse whitespace before tokenising so the alias key and the haystack use
+    # the same token sequence regardless of how the key was originally spaced.
+    alias_runs = _concept_runs(re.sub(r"\s+", " ", alias_key))
+    if not alias_runs:
+        return False
+    runs = _concept_runs(normalized_text)
+    if not runs:
+        return False
+    # Join on a preserved separator so a multi-token alias key stays findable while
+    # adjacent tokens keep an edge to test against. Joining with "" would let
+    # "agent" match inside "agentopia"; separating with " " would break every
+    # multi-word concept, whose alias key is one glued word
+    # ("knowledgeaugmentedtransformer") that no spaced text can ever contain.
+    haystack = _RUN_SEPARATOR.join(runs)
+    needle = _RUN_SEPARATOR.join(alias_runs)
+    start = haystack.find(needle)
+    while start != -1:
+        end = start + len(needle)
+        before = haystack[start - 1] if start else ""
+        after = haystack[end] if end < len(haystack) else ""
+        # A boundary is satisfied at a separator, so only a *word* character
+        # glued to the match disqualifies it.
+        if not (before.isascii() and before.isalnum()) and not (
+            after.isascii() and after.isalnum()
+        ):
+            return True
+        start = haystack.find(needle, start + 1)
+    return False
+
+
 class ConceptMemory:
+    """Concept/alias memory used to normalise terminology while extracting.
+
+    The database is shared between runs, so rows are stamped with the document
+    they came from and `retrieve` only returns concepts belonging to the document
+    being processed. Without that filter, processing paper B surfaced paper A's
+    concepts into B's prompts.
+    """
+
     def __init__(self, path: str | Path):
         self.connection = sqlite3.connect(path)
         self.connection.row_factory = sqlite3.Row
@@ -901,7 +1012,8 @@ class ConceptMemory:
             CREATE TABLE IF NOT EXISTS concepts (
                 id TEXT PRIMARY KEY,
                 canonical_name TEXT NOT NULL,
-                definition TEXT NOT NULL DEFAULT ''
+                definition TEXT NOT NULL DEFAULT '',
+                document_key TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS aliases (
                 alias_key TEXT PRIMARY KEY,
@@ -916,6 +1028,24 @@ class ConceptMemory:
             );
             """
         )
+        self._ensure_document_key_column()
+
+    def _ensure_document_key_column(self) -> None:
+        """Add `concepts.document_key` to databases predating document scoping.
+
+        Existing rows default to '' and are treated as unowned, so they are never
+        returned for a document-keyed lookup. CREATE TABLE IF NOT EXISTS cannot
+        add a column to an existing table, hence the explicit migration.
+        """
+        columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(concepts)")
+        }
+        if "document_key" not in columns:
+            self.connection.execute(
+                "ALTER TABLE concepts ADD COLUMN document_key TEXT NOT NULL DEFAULT ''"
+            )
+            self.connection.commit()
 
     def upsert(
         self,
@@ -924,6 +1054,7 @@ class ConceptMemory:
         section_id: str = "",
         page: int | None = None,
         source_quote: str = "",
+        document_key: str = "",
     ) -> str:
         keys = _concept_keys(name)
         if not keys:
@@ -934,8 +1065,8 @@ class ConceptMemory:
         ).fetchone()
         concept_id = row["concept_id"] if row else f"concept-{hashlib.sha1(min(keys).encode()).hexdigest()[:12]}"
         self.connection.execute(
-            "INSERT OR IGNORE INTO concepts(id, canonical_name, definition) VALUES (?, ?, ?)",
-            (concept_id, name, definition),
+            "INSERT OR IGNORE INTO concepts(id, canonical_name, definition, document_key) VALUES (?, ?, ?, ?)",
+            (concept_id, name, definition, document_key),
         )
         if definition:
             self.connection.execute(
@@ -955,15 +1086,22 @@ class ConceptMemory:
         self.connection.commit()
         return concept_id
 
-    def retrieve(self, text: str, limit: int = 8) -> list[dict]:
-        normalized = _normalize_concept_text(text)
+    def retrieve(self, text: str, limit: int = 8, document_key: str = "") -> list[dict]:
+        normalized = _tokenized_concept_text(text)
+        if not normalized.strip():
+            return []
         rows = self.connection.execute(
             """
-            SELECT DISTINCT c.id, c.canonical_name, c.definition, a.alias_key
+            SELECT DISTINCT c.id, c.canonical_name, c.definition, c.document_key, a.alias_key
             FROM concepts c JOIN aliases a ON a.concept_id = c.id
             """
         ).fetchall()
-        matches = [dict(row) for row in rows if row["alias_key"] and row["alias_key"] in normalized]
+        matches = [
+            dict(row)
+            for row in rows
+            if _alias_occurs_in(row["alias_key"], normalized)
+            and (not document_key or row["document_key"] == document_key)
+        ]
         return matches[:limit]
 
     def count(self) -> int:
@@ -2852,6 +2990,7 @@ class LongDocumentPipeline:
         reduce_max_output_tokens: int = 2200,
         document_max_output_tokens: int = 3000,
         document_title: str | None = None,
+        document_key: str = "",
     ):
         self.client = AsyncOpenAI(
             api_key=api_key,
@@ -2871,6 +3010,7 @@ class LongDocumentPipeline:
         self.reduce_max_output_tokens = max(256, reduce_max_output_tokens)
         self.document_max_output_tokens = max(256, document_max_output_tokens)
         self.document_title = document_title
+        self.document_key = document_key
         self._document_fact_index: dict[str, dict] = {}
         self.group_fallbacks = 0
         # Truncation recovery budget: when a response is cut off mid-stream (or the
@@ -3232,7 +3372,7 @@ class LongDocumentPipeline:
         if cached:
             result = _apply_grounding(ChunkExtraction.model_validate(cached), chunk.text, chunk.page_texts)
             return _assign_fact_ids(result, section.id)
-        memory = self.memory.retrieve(chunk.text)
+        memory = self.memory.retrieve(chunk.text, document_key=getattr(self, "document_key", ""))
         system = """你是严格的长文事实抽取器。只抽取原文明确支持的信息，并输出 JSON：
 {"summary":"本块摘要","facts":[{"concept":"概念","statement":"事实","kind":"definition|formula|method|result|limitation|advantage|disadvantage|example|relation|classification|dataset|metric","source_quote":"原文逐字引用","page":1,"confidence":0.95}],"new_concepts":["概念"]}
 source_quote 必须是原文中的连续文本；不得补充原文没有的因果关系。直接逐字证据通常使用 0.8-1.0 的置信度，不要机械照抄示例值。
@@ -3659,6 +3799,7 @@ source_fact_ids 必须来自 fact_catalog；章节和页码留空，由程序反
                     section.id,
                     fact.page,
                     fact.source_quote,
+                    getattr(self, "document_key", ""),
                 )
         synthesis = await self.synthesize_section(section, extractions)
         return {
@@ -3782,6 +3923,7 @@ async def _run(args: argparse.Namespace) -> None:
         reduce_max_output_tokens=args.reduce_max_output_tokens,
         document_max_output_tokens=args.document_max_output_tokens,
         document_title=_candidate_document_title(root),
+        document_key=args.document_key or _document_key(args.pdf),
     )
     try:
         results = []
@@ -3823,6 +3965,12 @@ def main() -> None:
     parser.add_argument("--memory-db", default="p2g_v2_memory.sqlite3")
     parser.add_argument("--cache-db", default="p2g_v2_cache.sqlite3")
     parser.add_argument("--usage-db", default="p2g_v2_usage.sqlite3")
+    parser.add_argument(
+        "--document-key",
+        default="",
+        help="Override the document identity used to scope concept memory "
+        "(defaults to a hash of the PDF content).",
+    )
     parser.add_argument("--max-tokens", type=int, default=3200)
     parser.add_argument("--overlap-tokens", type=int, default=180)
     parser.add_argument("--section", action="append")

@@ -69,6 +69,7 @@ from p2g_v2 import (  # noqa: E402
     split_text,
     _quote_is_grounded,
     _response_request_id,
+    _alias_occurs_in,
     _grounded_payload,
     batch_by_token_budget,
     build_section_evidence,
@@ -555,6 +556,96 @@ class ConceptMemoryTests(unittest.TestCase):
             self.assertEqual(memory.count(), 3)
             self.assertEqual(len(memory.retrieve("支持 向量机适合分类")), 1)
             memory.close()
+
+    def test_alias_must_match_a_whole_token(self):
+        # Substring matching retrieved pure noise on a real 1530-alias DB: these
+        # exact pairs were junk `related_memory` injected into extraction prompts.
+        for alias, text in [
+            ("her", "the other agents were there"),
+            ("position", "the composition of the dataset"),
+            ("actions", "rich interactions between agents"),
+            ("map", "running around the checkpoint"),
+            ("agent", "Agentopia is a society simulator"),
+        ]:
+            with self.subTest(alias=alias, text=text):
+                self.assertFalse(_alias_occurs_in(alias, text))
+
+    def test_whole_token_match_still_detects_real_mentions(self):
+        self.assertTrue(_alias_occurs_in("agent", "each agent acts"))
+        self.assertTrue(_alias_occurs_in("ai", "an AI system"))
+        # A stray space between CJK characters must not split the token.
+        self.assertTrue(_alias_occurs_in("支持向量机", "支持 向量机适合分类"))
+
+    def test_alias_match_folds_case(self):
+        # The real DB stores the acronym alias key uppercase ('AI').
+        self.assertTrue(_alias_occurs_in("AI", "an ai system"))
+        self.assertTrue(_alias_occurs_in("ai", "an AI system"))
+
+    def test_retrieve_scopes_to_the_current_document(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            memory = ConceptMemory(Path(temp_dir) / "memory.sqlite3")
+            memory.upsert("Agentopia", "多智能体社会", document_key="doc-a")
+            memory.upsert("Knowledge Augmented Transformer", "KAT", document_key="doc-b")
+
+            a = [row["canonical_name"] for row in memory.retrieve("Agentopia", document_key="doc-a")]
+            b = [row["canonical_name"] for row in memory.retrieve("Agentopia", document_key="doc-b")]
+
+            self.assertEqual(["Agentopia"], a)
+            self.assertEqual([], b)  # must not leak across documents
+            memory.close()
+
+    def test_legacy_rows_without_owner_do_not_leak_into_a_scoped_lookup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            memory = ConceptMemory(Path(temp_dir) / "memory.sqlite3")
+            # Rows written before document scoping existed carry no owner. They
+            # stay reachable for an unscoped lookup, but must never appear inside a
+            # specific document's retrieval -- that is the cross-document leak.
+            memory.upsert("Legacy")
+
+            self.assertEqual(1, len(memory.retrieve("Legacy Concept")))
+            self.assertEqual(
+                [], memory.retrieve("Legacy Concept", document_key="doc-any")
+            )
+            # An empty document key is "unscoped", so it does not claim the row.
+            self.assertEqual(1, len(memory.retrieve("Legacy Concept", document_key="")))
+            memory.close()
+
+    def test_alias_match_keeps_cjk_substring_semantics(self):
+        # CJK is written without spaces; a gap in extracted text is an artefact.
+        self.assertTrue(_alias_occurs_in("支持向量机", "本文使用支持向量机进行分类"))
+        # A CJK token that merely *starts* with the alias still matches, because
+        # segmenting Chinese needs a dictionary and the pre-existing behaviour
+        # relies on substring semantics here.
+        self.assertTrue(_alias_occurs_in("支持向量机", "支持向量机器"))
+
+    def test_multi_word_alias_requires_all_tokens_adjacent(self):
+        # A multi-word concept's alias key is glued into one word, so it must not
+        # match a partial phrase. This strictness is what suppresses retrieval noise.
+        self.assertFalse(
+            _alias_occurs_in("knowledgeaugmentedtransformer", "the knowledge transformer")
+        )
+
+    def test_known_limitation_multi_word_alias_is_unmatchable(self):
+        # KNOWN LIMITATION, asserted so it cannot regress silently into noise.
+        #
+        # `_concept_keys` glues a multi-word name into one key ("Knowledge Augmented
+        # Transformer" -> "knowledgeaugmentedtransformer"), while matching works on
+        # token runs separated by a boundary marker. The glued needle therefore
+        # never appears in the separated haystack, so *multi-word* concept aliases
+        # effectively never match. Single-word aliases ("agent", "AI", "KAT") and
+        # CJK aliases are unaffected.
+        #
+        # The consequence is a recall loss for multi-word terminology, not a
+        # precision loss, and it is the error direction a verifiable-extraction
+        # project wants. Fixing it properly means tokenising the alias key at
+        # storage time (changing concept identity, alias_key PRIMARY KEY collisions
+        # and therefore the existing DB), so it is deliberately left as-is.
+        self.assertFalse(
+            _alias_occurs_in(
+                "knowledgeaugmentedtransformer",
+                "the Knowledge Augmented Transformer (KAT)",
+            )
+        )
 
 
 class UtilityTests(unittest.TestCase):
