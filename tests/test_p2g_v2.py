@@ -68,6 +68,7 @@ from p2g_v2 import (  # noqa: E402
     shard_section_evidence,
     split_text,
     _quote_is_grounded,
+    _response_request_id,
     _grounded_payload,
     batch_by_token_budget,
     build_section_evidence,
@@ -1977,6 +1978,108 @@ class UsageTrackerTests(unittest.TestCase):
             self.assertEqual(summary["output_tokens"], 60)
             self.assertEqual(summary["by_model"]["pro"]["calls"], 1)
             tracker.close()
+
+    def test_summary_reports_only_the_current_run(self):
+        # The usage DB is append-only and shared between runs, so `summary()` must
+        # not report the lifetime total: a prior run's calls must be excluded while
+        # `all_time_summary()` still counts them.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "usage.sqlite3"
+
+            first = UsageTracker(db)
+            first.record("chunk_extract", "flash", 1000, 500, 1500, 3.0, "req-a")
+            first.record("chunk_extract", "flash", 1000, 500, 1500, 3.0, "req-b")
+            first.close()
+
+            second = UsageTracker(db)
+            second.record("section_reduce", "pro", 200, 40, 240, 2.5, "req-c")
+
+            current = second.summary()
+            self.assertEqual(current["calls"], 1)
+            self.assertEqual(current["total_tokens"], 240)
+            self.assertEqual(set(current["by_model"]), {"pro"})
+            self.assertIn("run_started_at", current)
+
+            lifetime = second.all_time_summary()
+            self.assertEqual(lifetime["calls"], 3)
+            self.assertEqual(lifetime["total_tokens"], 3240)
+            self.assertEqual(lifetime["by_model"]["flash"]["calls"], 2)
+            self.assertEqual(lifetime["by_model"]["pro"]["calls"], 1)
+            self.assertNotIn("run_started_at", lifetime)
+            second.close()
+
+    def test_summary_is_empty_for_a_run_that_records_nothing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "usage.sqlite3"
+            writer = UsageTracker(db)
+            writer.record("chunk_extract", "flash", 10, 5, 15, 0.1, "req-1")
+            writer.close()
+
+            idle = UsageTracker(db)
+            summary = idle.summary()
+            self.assertEqual(summary["calls"], 0)
+            self.assertEqual(summary["total_tokens"], 0)
+            self.assertEqual(summary["by_model"], {})
+            self.assertEqual(idle.all_time_summary()["calls"], 1)
+            idle.close()
+
+    def test_stats_separates_run_usage_from_lifetime_usage(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "usage.sqlite3"
+            previous = UsageTracker(db)
+            previous.record("chunk_extract", "flash", 1000, 500, 1500, 3.0, "req-old")
+            previous.close()
+
+            pipeline = LongDocumentPipeline.__new__(LongDocumentPipeline)
+            pipeline.usage = UsageTracker(db)
+            pipeline.cache = ResultCache(Path(temp_dir) / "cache.sqlite3")
+            pipeline.group_fallbacks = 0
+            pipeline.usage.record("global_answer", "flash", 100, 10, 110, 1.0, "req-new")
+
+            stats = pipeline.stats()
+
+            self.assertEqual(stats["usage"]["calls"], 1)
+            self.assertEqual(stats["usage"]["total_tokens"], 110)
+            self.assertEqual(stats["all_time_usage"]["calls"], 2)
+            self.assertEqual(stats["all_time_usage"]["total_tokens"], 1610)
+            pipeline.usage.close()
+            pipeline.cache.close()
+
+    def test_response_request_id_prefers_sdk_id_attribute(self):
+        # Real SDK responses carry `id`. The old code read `_request_id`, which no
+        # SDK object defines, so the usage column was always empty.
+        response = SimpleNamespace(id="chatcmpl-abc123", _request_id="legacy-id")
+
+        self.assertEqual("chatcmpl-abc123", _response_request_id(response))
+
+    def test_response_request_id_falls_back_and_tolerates_missing(self):
+        self.assertEqual("legacy-id", _response_request_id(SimpleNamespace(_request_id="legacy-id")))
+        self.assertEqual("", _response_request_id(SimpleNamespace()))
+        self.assertEqual("", _response_request_id(SimpleNamespace(id="", _request_id="")))
+        self.assertEqual("", _response_request_id(SimpleNamespace(id=None)))
+
+    def test_sdk_exposes_the_id_attribute_this_code_reads(self):
+        # Guard against the attribute name drifting away from the installed SDK.
+        from openai.types.chat import ChatCompletion
+
+        self.assertIn("id", ChatCompletion.model_fields)
+
+    def test_recorded_usage_carries_the_provider_request_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pipeline = LongDocumentPipeline.__new__(LongDocumentPipeline)
+            pipeline.usage = UsageTracker(Path(temp_dir) / "usage.sqlite3")
+
+            response = SimpleNamespace(
+                id="chatcmpl-real-1",
+                usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+            )
+            pipeline._record_usage("chunk_extract", "flash", response, 0.0)
+
+            row = pipeline.usage.connection.execute(
+                "SELECT request_id FROM usage"
+            ).fetchone()
+            self.assertEqual("chatcmpl-real-1", row[0])
+            pipeline.usage.close()
 
     def test_fact_supports_advantage_and_disadvantage_tags(self):
         common = {

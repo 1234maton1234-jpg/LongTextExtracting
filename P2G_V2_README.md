@@ -92,7 +92,7 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1 `
 - `source_fact_ids` 是否非空，`source_pages` 是否能定位回原文。
 - 定量回答中的数字是否与对应事实完全一致。
 - `contradictions` 是否能发现跨页数字或结论冲突。
-- `stats.usage` 可查看请求数、Token 和耗时。
+- `stats.usage` 可查看**本次运行**的请求数、Token 和耗时（含 `run_started_at` 起始时间戳）；`stats.all_time_usage` 是 usage 数据库的**历史累计**值。两者分开统计——usage 库是追加共享的，早先版本把累计值当成本次运行数据，会严重高估单次成本。`stats.cache` 的 `hits`/`misses` 本身就是本次运行的计数。
 
 系统优先检索当前论文的 Abstract / Results / Discussion / Conclusion，降低 Related Work 对定量结论的干扰。模型返回空、伪造或不支持答案的事实 ID 时，程序只从本次问题的证据白名单中最多选择 3 条；仍无法支持时会直接使用已验证事实作保守答案。
 

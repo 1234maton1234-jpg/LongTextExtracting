@@ -1010,6 +1010,19 @@ class ResultCache:
 
 
 class UsageTracker:
+    """Per-run and all-time API usage accounting.
+
+    The ``usage`` table is append-only and shared across runs, so a naive
+    ``SUM(...) FROM usage`` reports the lifetime total of the database, not what
+    the current run spent. ``summary()`` therefore scopes to the rows written
+    since this tracker was opened, and ``all_time_summary()`` exposes the
+    lifetime aggregate explicitly. Both are reported in the output JSON so a
+    cost estimate cannot silently mix the two.
+
+    Tokens are always written with a UTC "+00:00" suffix, so comparing the ISO
+    strings lexicographically is exactly comparing instants.
+    """
+
     def __init__(self, path: str | Path):
         self.connection = sqlite3.connect(path)
         self.connection.execute(
@@ -1026,6 +1039,9 @@ class UsageTracker:
             )
             """
         )
+        # Captured before the first write, so every row recorded by this tracker
+        # sorts at or after it.
+        self.run_started_at = datetime.now(timezone.utc).isoformat()
 
     def record(
         self,
@@ -1052,20 +1068,24 @@ class UsageTracker:
         )
         self.connection.commit()
 
-    def summary(self) -> dict:
+    def _aggregate(self, since: str | None) -> dict:
+        where = " WHERE created_at >= ?" if since else ""
+        params: tuple = (since,) if since else ()
         totals = self.connection.execute(
-            """
+            f"""
             SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
                    COALESCE(SUM(total_tokens), 0), COALESCE(SUM(latency_seconds), 0)
-            FROM usage
-            """
+            FROM usage{where}
+            """,
+            params,
         ).fetchone()
         by_model = {}
         for row in self.connection.execute(
-            """
+            f"""
             SELECT model, COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(total_tokens), SUM(latency_seconds)
-            FROM usage GROUP BY model
-            """
+            FROM usage{where} GROUP BY model
+            """,
+            params,
         ):
             by_model[row[0]] = {
                 "calls": row[1],
@@ -1083,8 +1103,34 @@ class UsageTracker:
             "by_model": by_model,
         }
 
+    def summary(self) -> dict:
+        """Usage recorded by this run only. Same shape as `all_time_summary`."""
+        result = self._aggregate(self.run_started_at)
+        result["run_started_at"] = self.run_started_at
+        return result
+
+    def all_time_summary(self) -> dict:
+        """Lifetime usage of the database, across every run that shares it."""
+        return self._aggregate(None)
+
     def close(self) -> None:
         self.connection.close()
+
+
+def _response_request_id(response: object) -> str:
+    """Provider-side identifier for a completion, for the usage ledger.
+
+    The OpenAI SDK exposes it as ``id`` on the response model (``ChatCompletion``
+    declares ``id`` as a field). An earlier version read ``_request_id``, which no
+    real SDK object has -- so every row in the usage DB recorded an empty string
+    and the column was useless. ``_request_id`` is kept as a fallback so responses
+    produced by test doubles or older adapters still resolve.
+    """
+    for attribute in ("id", "_request_id"):
+        value = getattr(response, attribute, None)
+        if value:
+            return str(value)
+    return ""
 
 
 def _quote_is_grounded(quote: str, source: str) -> bool:
@@ -3065,7 +3111,7 @@ class LongDocumentPipeline:
             int(getattr(usage, "completion_tokens", 0) or 0),
             int(getattr(usage, "total_tokens", 0) or 0),
             elapsed,
-            str(getattr(response, "_request_id", "") or ""),
+            _response_request_id(response),
         )
 
     def _message_content(self, response: object) -> str:
@@ -3567,7 +3613,11 @@ source_fact_ids 必须来自 fact_catalog；章节和页码留空，由程序反
 
     def stats(self) -> dict:
         return {
+            # `usage` is this run only; `all_time_usage` is the lifetime total of
+            # the usage DB. Keeping them separate stops a cost estimate from
+            # silently reporting the whole history.
             "usage": self.usage.summary(),
+            "all_time_usage": self.usage.all_time_summary(),
             "cache": self.cache.summary(),
             "group_fallbacks": self.group_fallbacks,
         }
