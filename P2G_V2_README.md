@@ -106,7 +106,8 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1 `
 | `fact_count` | 可作为证据的事实总数（仅计 `grounded=true`，含表格/指标/矛盾派生事实） |
 | `answers_with_evidence` | 10 问中**至少引用 1 条事实**的题数——低于 10 就说明有题目无证据可依 |
 | `citation_precision` | 引用的 fact_id 中能在事实索引里解析到的比例 |
-| `unsupported_claim_rate` | 无据句子占全部答案句子的比例 |
+| `unsupported_claim_rate` | 无据句子占**模型总输出句子**的比例（= 无据 /（保留 + 无据））。分母**必须**包含被剔除的句子：句子级审计会把无据句**从 `answer` 里删掉**并记入 `unsupported_claims`，只用保留句数做分母会算出 >1.0 的"比例"（实测 2.50），且短答案因为被删得多反而显得更差 |
+| `supported_sentence_count` / `model_sentence_count` | 保留在 `answer` 里的句数 / 模型总输出句数（两者之差即被剔除的句数） |
 | `unsupported_retrieval_gaps` | 无据句中**事实库里其实有**的条数——即"检索没送到"，属召回问题 |
 | `unsupported_undecided` | 无据句中事实库无法解释的条数——**是幻觉上界，不是幻觉判定**（见下文） |
 | `min/median/max_cited_facts` | 每题引用事实数的分布（`min` **包含**零引用的题，否则会掩盖"某题完全没证据"这一最该被抓的情况） |

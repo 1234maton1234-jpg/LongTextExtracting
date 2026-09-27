@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from datetime import datetime, timezone
 from typing import Literal
 
+import pymupdf
 import pymupdf4llm
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -419,10 +420,45 @@ def _strip_picture_text(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def extract_pdf_pages(pdf_path: str | Path) -> list[PageMarkdown]:
+def validate_pdf(pdf_path: str | Path) -> int:
+    """Open the PDF and return its page count, failing with a usable message.
+
+    A truncated or otherwise damaged file otherwise surfaces as a cryptic
+    ``FzErrorArgument: not a dict (null)`` raised deep inside pymupdf4llm's layout
+    pass, which says nothing about the real cause. Measured on a real case: a
+    27 MB PDF whose upload was cut off (header intact, no ``%%EOF``, no page tree)
+    opened as 0 pages and crashed the layout code. Opening the file first turns
+    that into an actionable error.
+    """
     path = Path(pdf_path)
     if not path.exists():
         raise FileNotFoundError(path)
+    try:
+        with pymupdf.open(str(path)) as document:
+            pages = document.page_count
+    except Exception as error:  # noqa: BLE001 - surface any mupdf failure verbatim
+        raise ValueError(
+            f"cannot open PDF {path.name!r}: {type(error).__name__}: {error}. "
+            "The file may be truncated or damaged; re-download it and retry."
+        ) from error
+    if pages == 0:
+        truncated = b"%%EOF" not in path.read_bytes()[-4096:]
+        hint = (
+            " It has no %%EOF trailer, so the upload/download was likely cut short."
+            if truncated
+            else ""
+        )
+        raise ValueError(
+            f"PDF {path.name!r} opened but reports 0 pages, so its page tree is "
+            f"unreadable (size {path.stat().st_size} bytes).{hint} "
+            "Re-obtain the original file and retry."
+        )
+    return pages
+
+
+def extract_pdf_pages(pdf_path: str | Path) -> list[PageMarkdown]:
+    path = Path(pdf_path)
+    validate_pdf(path)
     raw_pages = pymupdf4llm.to_markdown(str(path), page_chunks=True)
     pages = []
     for index, item in enumerate(raw_pages):
@@ -2238,14 +2274,15 @@ def _answer_sentences(text: str) -> list[str]:
     return [part.strip() for part in _SENTENCE_SPLIT_RE.split(stripped) if part.strip()]
 
 
-def _supported_sentence_count(unsupported: list[str], sentence_count: int) -> int:
-    """Sentences with evidence, derived from the audited unsupported list.
+def _supported_sentence_count(unsupported: list[str], surviving: int) -> int:
+    """Sentences retained in the answer, floored at zero.
 
-    `unsupported_claims` holds the offending sentences (not per-sentence flags),
-    so the supported count is the remainder, floored at zero because that list can
-    also carry a whole-answer entry injected by `_apply_answer_provenance`.
+    The audit DELETES ungrounded sentences from `answer` and records them in
+    `unsupported_claims`, so the sentences still present are the supported ones.
+    The floor guards the case where `_apply_answer_provenance` appends a
+    whole-answer entry to that list.
     """
-    return max(0, sentence_count - len(unsupported))
+    return max(0, surviving)
 
 
 def _evidence_supports(fact: dict, num_cited: int) -> bool:
@@ -2265,12 +2302,20 @@ def _evidence_supports(fact: dict, num_cited: int) -> bool:
 
 
 def _answer_metrics(answer: dict, fact_index: dict[str, dict]) -> dict:
-    """Deterministic provenance metrics for one global answer."""
+    """Deterministic provenance metrics for one global answer.
+
+    Counting note: `_audit_answer_claims` MOVES ungrounded sentences out of `answer`
+    into `unsupported_claims` and keeps only the grounded ones in `answer`. So the
+    model's total output is `surviving + unsupported`, which is the only correct
+    denominator: dividing unsupported by the surviving count alone yields rates
+    above 1.0 (measured 2.50 on one answer) and makes short answers look worse than
+    long ones purely because they were pruned harder.
+    """
     answer_text = str(answer.get("answer", ""))
     unsupported = [str(item) for item in (answer.get("unsupported_claims") or [])]
-    sentences = _answer_sentences(answer_text)
-    sentence_count = len(sentences)
-    supported = _supported_sentence_count(unsupported, sentence_count)
+    surviving = _answer_sentences(answer_text)
+    surviving_count = len(surviving)
+    model_sentence_count = surviving_count + len(unsupported)
 
     cited_ids = [str(entry) for entry in (answer.get("source_fact_ids") or []) if entry]
     resolved = [fact_id for fact_id in cited_ids if fact_id in fact_index]
@@ -2282,7 +2327,7 @@ def _answer_metrics(answer: dict, fact_index: dict[str, dict]) -> dict:
     support = sum(
         1
         for fact_id in resolved
-        if _evidence_supports(fact_index[fact_id], sentence_count)
+        if _evidence_supports(fact_index[fact_id], model_sentence_count)
     )
     pages = {int(page) for page in (answer.get("source_pages") or [])}
 
@@ -2292,10 +2337,13 @@ def _answer_metrics(answer: dict, fact_index: dict[str, dict]) -> dict:
         "resolvable_fact_count": len(resolved),
         "citation_resolvable_rate": round(resolvable, 4),
         "unsupported_claim_count": len(unsupported),
-        "sentence_count": sentence_count,
-        "supported_sentence_count": supported,
+        # Sentences still in `answer` (i.e. grounded) and the model's total output.
+        "supported_sentence_count": surviving_count,
+        "model_sentence_count": model_sentence_count,
         "unsupported_claim_rate": (
-            round(len(unsupported) / sentence_count, 4) if sentence_count else 0.0
+            round(len(unsupported) / model_sentence_count, 4)
+            if model_sentence_count
+            else 0.0
         ),
         "sufficient_evidence": bool(cited_ids) and support > 0,
         "distinct_source_pages": len(pages),
@@ -2465,7 +2513,9 @@ def run_evidence_metrics(
     total_cited = sum(item["cited_fact_count"] for item in per_answer)
     total_resolved = sum(item["resolvable_fact_count"] for item in per_answer)
     total_unsupported = sum(item["unsupported_claim_count"] for item in per_answer)
-    total_sentences = sum(item["sentence_count"] for item in per_answer)
+    # The model's total sentence output, not just the sentences that survived the
+    # audit. See `_answer_metrics` for why this denominator matters.
+    total_sentences = sum(item["model_sentence_count"] for item in per_answer)
     retrieval_gaps = sum(
         1
         for item in per_answer
@@ -4352,14 +4402,16 @@ def report_evidence_metrics(output_path: str | Path) -> dict:
         f"undecided={metrics['unsupported_undecided']} "
         f"(total {metrics['total_unsupported_claims']}; undecided bounds fabrication)"
     )
-    print(f"\n{'#':>2} {'cited':>5} {'resolv':>6} {'suff':>5} {'sent':>4} "
-          f"{'unsup':>5} {'pages':>5}  question")
+    print(f"\n{'#':>2} {'cited':>5} {'resolv':>6} {'suff':>5} {'kept':>4} {'unsup':>5} "
+          f"{'rate':>5} {'pages':>5}  question")
     for index, item in enumerate(metrics["per_answer"], 1):
         print(
             f"{index:>2} {item['cited_fact_count']:>5} "
             f"{item['resolvable_fact_count']:>6} "
             f"{str(item['sufficient_evidence']):>5} "
-            f"{item['sentence_count']:>4} {item['unsupported_claim_count']:>5} "
+            f"{item['supported_sentence_count']:>4} "
+            f"{item['unsupported_claim_count']:>5} "
+            f"{item['unsupported_claim_rate']:>5.2f} "
             f"{item['distinct_source_pages']:>5}  {item['question']}"
         )
     return metrics

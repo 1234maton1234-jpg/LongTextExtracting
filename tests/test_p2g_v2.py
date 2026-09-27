@@ -819,20 +819,48 @@ class EvidenceMetricsTests(unittest.TestCase):
         self.assertEqual(2, m["per_answer"][0]["cited_fact_count"])
         self.assertEqual(1, m["per_answer"][0]["resolvable_fact_count"])
 
-    def test_unsupported_claim_rate_is_per_sentence(self):
+    def test_unsupported_claim_rate_uses_the_models_total_output(self):
+        # The audit DELETES ungrounded sentences from `answer` and records them in
+        # `unsupported_claims`, so real output has them disjoint: `answer` holds
+        # only the grounded sentences. The denominator is therefore
+        # surviving + unsupported = the model's total output.
+        # (Verified against real runs: answer sentences and unsupported_claims
+        # never overlap.)
         results = [self._section([self._fact("f1")])]
         synthesis = {
             "global_answers": [
-                self._answer("Q1", "有据。无据甲。无据乙。", ["f1"], unsupported=["无据甲。", "无据乙。"]),
+                self._answer("Q1", "有据。", ["f1"], unsupported=["无据甲。", "无据乙。"]),
+            ]
+        }
+
+        m = run_evidence_metrics(results, synthesis)
+        item = m["per_answer"][0]
+
+        self.assertEqual(1, item["supported_sentence_count"])   # kept in `answer`
+        self.assertEqual(3, item["model_sentence_count"])       # 1 kept + 2 moved out
+        self.assertEqual(
+            item["model_sentence_count"],
+            item["supported_sentence_count"] + item["unsupported_claim_count"],
+        )
+        self.assertEqual(2, m["total_unsupported_claims"])
+        self.assertAlmostEqual(2 / 3, item["unsupported_claim_rate"], places=4)
+        self.assertLessEqual(item["unsupported_claim_rate"], 1.0)
+
+    def test_unsupported_claim_rate_never_exceeds_one(self):
+        # A heavily pruned answer: 1 sentence survived, 5 were dropped. The old
+        # denominator produced 5/1 = 5.0.
+        results = [self._section([self._fact("f1")])]
+        synthesis = {
+            "global_answers": [
+                self._answer("Q1", "唯一保留的句子。", ["f1"],
+                             unsupported=[f"被剔除的句子{i}。" for i in range(5)]),
             ]
         }
 
         m = run_evidence_metrics(results, synthesis)
 
-        self.assertEqual(3, m["per_answer"][0]["sentence_count"])
-        self.assertEqual(1, m["per_answer"][0]["supported_sentence_count"])
-        self.assertEqual(2, m["total_unsupported_claims"])
-        self.assertAlmostEqual(2 / 3, m["per_answer"][0]["unsupported_claim_rate"], places=4)
+        self.assertAlmostEqual(5 / 6, m["per_answer"][0]["unsupported_claim_rate"], places=4)
+        self.assertLessEqual(m["unsupported_claim_rate"], 1.0)
 
     def test_ungrounded_facts_are_not_evidence(self):
         results = [self._section([self._fact("f1", grounded=False)])]
