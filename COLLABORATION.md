@@ -10,7 +10,7 @@
    git clone https://github.com/1234maton1234-jpg/LongTextExtracting.git
    cd LongTextExtracting
    ```
-3. 安装环境（自动创建 `.venv` 并安装依赖）：
+3. 安装环境（自动创建 `longtext` 虚拟环境并安装依赖）：
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\setup.ps1
    ```
@@ -19,7 +19,7 @@
    Copy-Item .env.example .env
    ```
    编辑 `.env`，把 `DEEPSEEK_API_KEY` 改成**你自己的**（不要用别人的，不要提交）。
-5. 跑测试确认环境正常（176 个应全部通过）：
+5. 跑测试确认环境正常（192 个应全部通过）：
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\test.ps1
    ```
@@ -71,4 +71,4 @@ git push origin dev-你的名字
 - **`setup.ps1` 报 "64-bit Python 3.10-3.13 was not found"**：本机需要先安装 64 位 Python 3.10-3.13 并勾选加入 PATH。
 - **`run.ps1` 报 "DEEPSEEK_API_KEY is missing"**：还没配 `.env`，见上文第 4 步。
 - **API 限流 / 请求报错**：加 `-Concurrency 1`（或 2）降低并发重试。
-- **`.venv` 损坏**：删掉 `.venv` 文件夹，重新跑 `setup.ps1`。
+- **`longtext` 环境损坏**：删掉 `longtext` 文件夹，重新跑 `setup.ps1`。

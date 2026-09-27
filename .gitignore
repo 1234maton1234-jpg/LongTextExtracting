@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+# 本项目的虚拟环境目录名（与 setup.ps1 / run.ps1 / test.ps1 保持一致）
+longtext/
 
 # --- 缓存 / 测试缓存 ---
 .pytest_cache/

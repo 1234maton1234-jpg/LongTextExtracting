@@ -4,6 +4,10 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectRoot
 
+# Single source of truth for the virtual-environment folder name. Keep it in sync
+# with run.ps1 / test.ps1 and with .gitignore.
+$VenvName = "longtext"
+
 $Launcher = $null
 $LauncherArgs = @()
 $ProbeErrorAction = $ErrorActionPreference
@@ -39,7 +43,7 @@ if (-not $Launcher) {
     throw "64-bit Python 3.10-3.13 was not found."
 }
 
-$VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+$VenvPython = Join-Path $ProjectRoot "$VenvName\Scripts\python.exe"
 $NeedsVenv = -not (Test-Path -LiteralPath $VenvPython)
 if (-not $NeedsVenv) {
     $ProbeErrorAction = $ErrorActionPreference
@@ -49,7 +53,7 @@ if (-not $NeedsVenv) {
     $ErrorActionPreference = $ProbeErrorAction
 }
 if ($NeedsVenv) {
-    $VenvPath = Join-Path $ProjectRoot ".venv"
+    $VenvPath = Join-Path $ProjectRoot $VenvName
     & $Launcher @LauncherArgs -m venv --clear $VenvPath
     if ($LASTEXITCODE -ne 0) { throw "Failed to create the virtual environment." }
 }

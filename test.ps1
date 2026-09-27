@@ -2,7 +2,9 @@ param()
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+# Keep in sync with setup.ps1 / run.ps1 / .gitignore
+$VenvName = "longtext"
+$VenvPython = Join-Path $ProjectRoot "$VenvName\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $VenvPython)) {
     throw "The virtual environment is missing. Run .\setup.ps1 first."
 }

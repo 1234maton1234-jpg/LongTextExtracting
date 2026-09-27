@@ -130,8 +130,10 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1 `
 不重跑流水线也能对已有输出结算指标（无需 PDF 与 API Key）：
 
 ```powershell
-.\.venv\Scripts\python.exe python_scripts\p2g_v2.py --metrics outputs\p2g_v2_output.json
+.\longtext\Scripts\python.exe python_scripts\p2g_v2.py --metrics outputs\p2g_v2_output.json
 ```
+
+> 虚拟环境目录名为 **`longtext`**（由 `setup.ps1` 自动创建，与 `.gitignore` 同步）。
 
 ## 多轮评测（衡量方差，而不是单次结论）
 
@@ -139,7 +141,7 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1 `
 
 ```powershell
 # 对已存的运行结果重复「章节归纳 → 分组归纳 → 概述 → 10 问」N 次
-.\.venv\Scripts\python.exe python_scripts\multiround_eval.py `
+.\longtext\Scripts\python.exe python_scripts\multiround_eval.py `
   outputs\_e_Attention_1706.03762.json outputs\_e_SegEarth-OV_CVPR2025.json --rounds 3
 ```
 

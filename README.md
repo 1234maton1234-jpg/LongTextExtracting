@@ -13,14 +13,14 @@
 ## 快速开始
 
 ```powershell
-# 1. 安装依赖（自动创建 .venv）
+# 1. 安装依赖（自动创建 longtext 虚拟环境）
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
 
 # 2. 配置自己的 Key
 Copy-Item .env.example .env
 # 然后编辑 .env，把 DEEPSEEK_API_KEY 改成你自己的（示例文件里已写好注释）
 
-# 3. 跑测试确认环境正常（176 个应全部通过）
+# 3. 跑测试确认环境正常（192 个应全部通过）
 powershell -ExecutionPolicy Bypass -File .\test.ps1
 
 # 4. 运行（处理一份 PDF）
