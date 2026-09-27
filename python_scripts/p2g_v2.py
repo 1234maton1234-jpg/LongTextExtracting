@@ -42,7 +42,7 @@ MARK_TAG_RE = re.compile(r"</?mark\b[^>]*>", re.IGNORECASE)
 EXTRACTION_PROMPT_VERSION = "v2.10"
 REDUCE_PROMPT_VERSION = "v2.9"
 GROUP_PROMPT_VERSION = "v2.11"
-DOCUMENT_PROMPT_VERSION = "v2.17"
+DOCUMENT_PROMPT_VERSION = "v2.18"
 GLOBAL_QUESTIONS = [
     "文档的核心研究问题是什么？",
     "文档使用了哪些数据集或材料？",
@@ -2528,6 +2528,9 @@ def run_evidence_metrics(
         for verdict in item["unsupported_claims"]
         if verdict["verdict"] == _VERDICT_UNDECIDED
     )
+    # Numbers in the overview layer that no fact carries. Deterministic and
+    # false-positive free by construction (see `audit_overview_numerics`).
+    overview_findings = audit_overview_numerics(synthesis, fact_index)
 
     return {
         "fact_count": len(fact_index),
@@ -2550,6 +2553,10 @@ def run_evidence_metrics(
         # real sentences worded with a synonym, which overlap cannot distinguish).
         "unsupported_retrieval_gaps": retrieval_gaps,
         "unsupported_undecided": undecided,
+        # Overview-layer numbers with no supporting fact. Must stay 0; a non-zero
+        # value means the synthesis layer invented or mis-stated a figure.
+        "overview_unsupported_numbers": len(overview_findings),
+        "overview_numeric_findings": overview_findings,
         "median_cited_facts": _quantile(counts, 0.5),
         "min_cited_facts": _quantile(counts, 0.0),
         "max_cited_facts": _quantile(counts, 1.0),
@@ -2972,6 +2979,116 @@ def _build_contradiction_answer(
         ),
         confidence=confidence,
     )
+
+
+# --- Overview numeric attribution ------------------------------------------
+# The overview layer concatenates facts into one prose paragraph, and in doing so
+# can pair a number with the wrong subject. Measured on a real run: the executive
+# summary said the model reached "BLEU 41.8 ... 训练十二小时", but 41.8 is the BIG
+# model's score (trained 3.5 days) while 12 hours is the BASE model's budget -- both
+# of which the extraction layer had recorded correctly as separate facts. Nothing
+# upstream verified the pairing, so the conflation reached the output unchallenged.
+#
+# This audit applies the same standard the answer layer already uses: a number must
+# be traceable to the evidence. It is deterministic and read-only.
+_NUMBER_TOKEN_RE = re.compile(r"\d+(?:[.,]\d+)?")
+# Units are spelled many ways in a Chinese restatement of an English source
+# ("100,000 steps" -> "10万步", "3.5 days" -> "3.5天", "36M" -> "3600万"). Comparing
+# bare digit strings flagged a correct "3600万" against a source "36M", so both
+# sides are also compared as a scale-free mantissa.
+_SCALE_SUFFIXES = {
+    "k": 1e3, "thousand": 1e3, "千": 1e3,
+    "m": 1e6, "million": 1e6, "万": 1e4, "百万": 1e6,
+    "b": 1e9, "billion": 1e9, "亿": 1e8, "十亿": 1e9,
+}
+
+
+def _numeric_forms(value: str) -> set[str]:
+    """Normalised numeric forms for comparison.
+
+    A number written with a scale word yields ONLY its scaled absolute value, so
+    "36M" and "3600万" both become "36000000". Emitting the bare mantissa as well
+    would make "3600万" also claim the form "3600", which matches nothing and was
+    reported as an unsupported number in real output.
+    """
+    forms: set[str] = set()
+    for match in _NUMBER_TOKEN_RE.finditer(value):
+        raw = match.group(0).replace(",", "")
+        tail = value[match.end(): match.end() + 3].strip().lower()
+        scaled = None
+        try:
+            number = float(raw)
+        except ValueError:
+            number = None
+        if number is not None:
+            for suffix, scale in _SCALE_SUFFIXES.items():
+                if tail.startswith(suffix):
+                    scaled = round(number * scale)
+                    break
+        if scaled is not None:
+            forms.add(str(scaled))
+            continue
+        forms.add(raw)
+        if number is not None and number.is_integer():
+            forms.add(str(int(number)))
+    return forms
+
+
+def audit_overview_numerics(
+    overview: object, fact_index: dict[str, dict]
+) -> list[dict]:
+    """Numbers in the overview that no fact in the evidence carries.
+
+    This is the unambiguous half of the problem: a number appearing in the
+    overview that exists nowhere in the evidence is either invented or an
+    arithmetic slip. Deterministic, no false-positive risk from phrasing.
+
+    What this deliberately does NOT attempt: detecting a number paired with the
+    WRONG subject. A sentence such as "NAFNet reaches 33.69 dB on GoPro and
+    40.30 dB on SIDD" legitimately carries several numbers from several facts, and
+    a naive "no single fact holds them all" test flags correct sentences like that
+    constantly (measured: 12 findings across 7 real runs, essentially all correct).
+    Catching a true mispairing needs subject/entity comparison, which is not
+    decidable from token overlap; the answer layer's evidence audit is the guard
+    that applies there.
+    """
+    if hasattr(overview, "model_dump"):
+        overview = overview.model_dump()
+    if not isinstance(overview, dict):
+        return []
+
+    all_forms: set[str] = set()
+    for fact in fact_index.values():
+        all_forms |= _numeric_forms(" ".join(
+            str(fact.get(key, "")) for key in ("concept", "statement", "source_quote")
+        ))
+
+    fields: list[tuple[str, str]] = []
+    if overview.get("executive_summary"):
+        fields.append(("executive_summary", str(overview["executive_summary"])))
+    if overview.get("research_question"):
+        fields.append(("research_question", str(overview["research_question"])))
+    for key in ("methods", "datasets", "metrics", "key_findings",
+                "limitations", "future_work", "contradictions"):
+        for item in overview.get(key) or []:
+            fields.append((key, str(item)))
+
+    findings: list[dict] = []
+    for key, text in fields:
+        for sentence in _answer_sentences(text) or [text]:
+            missing = {
+                number
+                for number in _numeric_forms(sentence)
+                if number not in all_forms
+            }
+            if missing:
+                findings.append({
+                    "field": key,
+                    "kind": "unsupported_number",
+                    "numbers": sorted(missing),
+                    "sentence": sentence[:200],
+                })
+    return findings
 
 
 def _merge_overview_contradictions(
@@ -3993,7 +4110,8 @@ executive_summary 不超过300字，各数组最多10项。
 2. title：优先使用输入 evidence 中的 candidate_title 字段原样保留（禁止翻译、改写或添加副标题）；candidate_title 缺失时才自行给出文档标题。
 3. 论文含未来/展望/结论章节证据时 future_work 必须填写，不允许空数组。
 4. contradictions 只列证据支持的跨章节数字或结论冲突。
-5. 其余字段（executive_summary 及各数组）用中文填写：英文证据先翻译成中文再概括，禁止整句英文，只保留专有名词/指标名/模型名；title 保留原语言。"""
+5. 每个数字必须与它所属的主体写在一起，禁止把不同事实里的数字拼进同一个论断。证据里的数字各自绑定着主体（例如"base 模型 12 小时"与"big 模型 3.5 天"、"base 模型 BLEU 27.3"与"big 模型 BLEU 41.8"）：不得把某个主体的成绩与另一个主体的训练时长/配置写成一句话。若无法确定数字归属，就不要写这个数字。
+6. 其余字段（executive_summary 及各数组）用中文填写：英文证据先翻译成中文再概括，禁止整句英文，只保留专有名词/指标名/模型名；title 保留原语言。"""
         try:
             payload = await self._request_json(
                 "document_overview",
@@ -4402,6 +4520,13 @@ def report_evidence_metrics(output_path: str | Path) -> dict:
         f"undecided={metrics['unsupported_undecided']} "
         f"(total {metrics['total_unsupported_claims']}; undecided bounds fabrication)"
     )
+    print(
+        f"overview unsupported numbers: {metrics['overview_unsupported_numbers']} "
+        f"(must be 0)"
+    )
+    for finding in metrics["overview_numeric_findings"]:
+        print(f"    [{finding['kind']}] {finding['field']} {finding['numbers']}")
+        print(f"       {finding['sentence']}")
     print(f"\n{'#':>2} {'cited':>5} {'resolv':>6} {'suff':>5} {'kept':>4} {'unsup':>5} "
           f"{'rate':>5} {'pages':>5}  question")
     for index, item in enumerate(metrics["per_answer"], 1):

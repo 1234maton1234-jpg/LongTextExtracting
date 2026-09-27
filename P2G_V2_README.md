@@ -110,9 +110,14 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1 `
 | `supported_sentence_count` / `model_sentence_count` | 保留在 `answer` 里的句数 / 模型总输出句数（两者之差即被剔除的句数） |
 | `unsupported_retrieval_gaps` | 无据句中**事实库里其实有**的条数——即"检索没送到"，属召回问题 |
 | `unsupported_undecided` | 无据句中事实库无法解释的条数——**是幻觉上界，不是幻觉判定**（见下文） |
+| `overview_unsupported_numbers` | **概述层**（`executive_summary` / `research_question` / 各数组）中**任何事实都不支持**的数字个数。必须为 0；非 0 说明概述层凭空写了数字或算错了 |
 | `min/median/max_cited_facts` | 每题引用事实数的分布（`min` **包含**零引用的题，否则会掩盖"某题完全没证据"这一最该被抓的情况） |
 | `sufficient_evidence` | 该题是否达到证据下限（至少 1 条可支持本答案的引用事实） |
 | `per_answer` | 逐题明细，含每条无据句的 `verdict` 与 `coverage`，便于定位是哪一问退化 |
+
+`overview_unsupported_numbers` 检测的是**概述层数字无据**。它只做一件事：某个数字在整份证据里**一次都没出现**。数字比较会把量纲词折算成绝对值，所以 `36M` 与 `3600万`、`100,000 steps` 与 `10万步` 视为同一个数（不做这层折算会把正确表述误报为无据——这是实测踩过的坑）。
+
+它**不检测**"数字与主体错配"（例如把 big 模型的 BLEU 与 base 模型的训练时长写进一句）。实测过一版"句中所有数字必须由同一条事实同时承载"的规则，结果在 7 篇真实产物上触发 12 次、**几乎全是正确句子**（如"GoPro 33.69 dB、SIDD 40.30 dB"本身合法），因此废弃。抓真正的错配需要主体/实体比对，词元重叠判定不了。概述层的提示词里加了针对性的第 5 条约束（禁止把不同事实的数字拼进同一论断），但**其效果尚未实测**（需真实重跑）。
 
 **读法上的三个要点：**
 

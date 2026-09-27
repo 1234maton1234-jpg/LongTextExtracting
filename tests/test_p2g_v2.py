@@ -82,6 +82,8 @@ from p2g_v2 import (  # noqa: E402
     _TABLE_HEADER_CONCEPT,
     _claim_matches_fact_db,
     _claim_tokens,
+    _numeric_forms,
+    audit_overview_numerics,
 )
 
 
@@ -1049,6 +1051,107 @@ class EvidenceMetricsTests(unittest.TestCase):
         )
         self.assertIn("fact-tbl", quant_allowed)
 
+
+    def test_overview_audit_flags_a_number_absent_from_the_evidence(self):
+        overview = {
+            "executive_summary": "模型在某个基准上达到 99.9 dB 的最优性能。",
+            "methods": [], "datasets": [], "metrics": [], "key_findings": [],
+            "limitations": [], "future_work": [], "contradictions": [],
+        }
+        index = {
+            "f1": {"concept": "PSNR", "statement": "在该基准上达到 40.30 dB。",
+                   "source_quote": "40.30 dB"},
+        }
+
+        findings = audit_overview_numerics(overview, index)
+
+        self.assertEqual(1, len(findings))
+        self.assertEqual("unsupported_number", findings[0]["kind"])
+        self.assertIn("99.9", findings[0]["numbers"])
+        self.assertEqual("executive_summary", findings[0]["field"])
+
+    def test_overview_audit_passes_when_every_number_is_supported(self):
+        overview = {
+            "executive_summary": "在 GoPro 达到 33.69 dB，在 SIDD 达到 40.30 dB。",
+            "key_findings": ["超此前最佳 0.38 dB"],
+            "methods": [], "datasets": [], "metrics": [],
+            "limitations": [], "future_work": [], "contradictions": [],
+        }
+        index = {
+            "f1": {"statement": "GoPro 33.69 dB。", "source_quote": "33.69 dB"},
+            "f2": {"statement": "SIDD 40.30 dB。", "source_quote": "40.30 dB"},
+            "f3": {"statement": "超过此前最佳 0.38 dB。", "source_quote": "0.38 dB"},
+        }
+
+        self.assertEqual([], audit_overview_numerics(overview, index))
+
+    def test_overview_audit_does_not_flag_numbers_borrowed_across_facts(self):
+        # A sentence legitimately combining numbers from several facts must NOT be
+        # flagged: a "no single fact holds them all" rule fired on ~every real
+        # multi-number sentence, which made it useless as a signal.
+        overview = {
+            "executive_summary": "GoPro 达 33.69 dB、SIDD 达 40.30 dB，均超 SOTA。",
+            "methods": [], "datasets": [], "metrics": [], "key_findings": [],
+            "limitations": [], "future_work": [], "contradictions": [],
+        }
+        index = {
+            "f1": {"statement": "GoPro 33.69 dB。", "source_quote": "33.69 dB"},
+            "f2": {"statement": "SIDD 40.30 dB。", "source_quote": "40.30 dB"},
+        }
+
+        self.assertEqual([], audit_overview_numerics(overview, index))
+
+    def test_overview_audit_normalises_scale_words(self):
+        # A real case: the answer said "3600万" where the source says "36M". Bare
+        # digit comparison reported that correct statement as unsupported.
+        self.assertIn("36000000", _numeric_forms("36M sentences"))
+        index = {"f1": {"statement": "英法数据集包含 36M 句子。",
+                        "source_quote": "36M sentences"}}
+        overview = {
+            "executive_summary": "英法数据集包含 3600万 句子。",
+            "methods": [], "datasets": [], "metrics": [], "key_findings": [],
+            "limitations": [], "future_work": [], "contradictions": [],
+        }
+
+        self.assertEqual([], audit_overview_numerics(overview, index))
+
+    def test_overview_audit_scans_every_overview_field(self):
+        overview = {
+            "executive_summary": "", "research_question": "是否使用 12345 个样本？",
+            "methods": ["采用 54321 步训练"], "datasets": [], "metrics": [],
+            "key_findings": [], "limitations": [], "future_work": [], "contradictions": [],
+        }
+
+        findings = audit_overview_numerics(overview, {})
+
+        fields = {f["field"] for f in findings}
+        self.assertIn("research_question", fields)
+        self.assertIn("methods", fields)
+        self.assertEqual(2, len(findings))
+
+    def test_overview_audit_tolerates_a_model_and_empty_input(self):
+        self.assertEqual([], audit_overview_numerics(None, {}))
+        self.assertEqual([], audit_overview_numerics({}, {}))
+        overview = DocumentOverview(
+            title="T", executive_summary="达到 1.5 dB 提升。", research_question="q",
+            methods=[], datasets=[], metrics=[], key_findings=[],
+            limitations=[], future_work=[], contradictions=[],
+        )
+        self.assertEqual([], audit_overview_numerics(overview, {
+            "f1": {"statement": "提升 1.5 dB", "source_quote": "1.5 dB"},
+        }))
+
+    def test_metrics_report_the_overview_number_audit(self):
+        results = [self._section([self._fact("f1", statement="达到 40.30 dB。")])]
+        synthesis = {
+            "executive_summary": "达到 99.9 dB。",
+            "global_answers": [self._answer("Q1", "回答。", ["f1"])],
+        }
+
+        m = run_evidence_metrics(results, synthesis)
+
+        self.assertEqual(1, m["overview_unsupported_numbers"])
+        self.assertEqual(1, len(m["overview_numeric_findings"]))
 
     def test_backcheck_separates_retrieval_gap_from_undecided(self):
         # `_audit_answer_claims` only tests against the facts actually cited, so a
