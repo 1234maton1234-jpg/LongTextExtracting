@@ -1105,10 +1105,35 @@ class EvidenceMetricsTests(unittest.TestCase):
         # A real case: the answer said "3600万" where the source says "36M". Bare
         # digit comparison reported that correct statement as unsupported.
         self.assertIn("36000000", _numeric_forms("36M sentences"))
+        self.assertIn("36000000", _numeric_forms("3600万"))
+        self.assertIn("100000", _numeric_forms("10万步"))
+        self.assertIn("100000", _numeric_forms("100,000 steps"))
         index = {"f1": {"statement": "英法数据集包含 36M 句子。",
                         "source_quote": "36M sentences"}}
         overview = {
             "executive_summary": "英法数据集包含 3600万 句子。",
+            "methods": [], "datasets": [], "metrics": [], "key_findings": [],
+            "limitations": [], "future_work": [], "contradictions": [],
+        }
+
+        self.assertEqual([], audit_overview_numerics(overview, index))
+
+    def test_scale_word_must_be_a_whole_token(self):
+        # Regression: matching any token START read "41.8 BLEU" as 41.8 BILLION via
+        # the "b" of "BLEU", so correct sentences were reported as unsupported.
+        self.assertEqual({"41.8"}, _numeric_forms("41.8 BLEU"))
+        self.assertEqual({"41"}, _numeric_forms("41.0 BLEU"))
+        self.assertEqual({"1.5"}, _numeric_forms("1.5 BLEU"))
+        self.assertEqual({"60"}, _numeric_forms("60.0 IoU"))
+        # A genuine separate scale word is still folded.
+        self.assertEqual({"3500000"}, _numeric_forms("3.5 million"))
+
+    def test_integral_and_decimal_forms_compare_equal(self):
+        # "60.0" and "60" are the same quantity and must not be flagged against a
+        # source that writes the other form.
+        index = {"f1": {"statement": "洪水检测 IoU 提升至 60。", "source_quote": "to 60 IoU"}}
+        overview = {
+            "executive_summary": "洪水检测 IoU 提升至 60.0。",
             "methods": [], "datasets": [], "metrics": [], "key_findings": [],
             "limitations": [], "future_work": [], "contradictions": [],
         }

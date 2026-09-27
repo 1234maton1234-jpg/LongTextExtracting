@@ -3001,6 +3001,19 @@ _SCALE_SUFFIXES = {
     "m": 1e6, "million": 1e6, "万": 1e4, "百万": 1e6,
     "b": 1e9, "billion": 1e9, "亿": 1e8, "十亿": 1e9,
 }
+# A scale word must be attached ("36M") or a complete separate token
+# ("3.5 million"). Matching any token START wrongly read "41.8 BLEU" as 41.8
+# BILLION through the "b" of "BLEU" (and "1.5 BLEU" as 1.5 billion), which made
+# the overview audit report correct sentences as unsupported numbers.
+_SCALE_TAIL_RE = re.compile(r"\s*(?P<attached>[A-Za-z0-9\u3400-\u9fff]+)|(?P<word>[A-Za-z]+)(?!\w)")
+# CJK has no word spacing, so a scale word binds to whatever follows it: in
+# "10万步" the token is "万步", which is not the scale word "万". Inserting a
+# boundary after a CJK scale word lets the tail matcher see it on its own.
+_CJK_SCALE_WORDS = tuple(s for s in _SCALE_SUFFIXES if not s.isascii())
+_CJK_SCALE_BOUNDARY_RE = re.compile(
+    "(" + "|".join(re.escape(word) for word in sorted(_CJK_SCALE_WORDS, key=len, reverse=True)) + ")"
+    "(?=[\u3400-\u4dbf\u4e00-\u9fff])"
+)
 
 
 def _numeric_forms(value: str) -> set[str]:
@@ -3010,27 +3023,37 @@ def _numeric_forms(value: str) -> set[str]:
     "36M" and "3600万" both become "36000000". Emitting the bare mantissa as well
     would make "3600万" also claim the form "3600", which matches nothing and was
     reported as an unsupported number in real output.
+
+    Integral values are canonicalised ("60.0" and "60" both become "60") so a
+    trailing ".0" reads as the same quantity.
     """
+    value = _CJK_SCALE_BOUNDARY_RE.sub(r"\1 ", value)
     forms: set[str] = set()
     for match in _NUMBER_TOKEN_RE.finditer(value):
         raw = match.group(0).replace(",", "")
-        tail = value[match.end(): match.end() + 3].strip().lower()
-        scaled = None
         try:
             number = float(raw)
         except ValueError:
-            number = None
-        if number is not None:
-            for suffix, scale in _SCALE_SUFFIXES.items():
-                if tail.startswith(suffix):
-                    scaled = round(number * scale)
-                    break
-        if scaled is not None:
-            forms.add(str(scaled))
+            forms.add(raw)
             continue
-        forms.add(raw)
-        if number is not None and number.is_integer():
-            forms.add(str(int(number)))
+        scaled = None
+        tail = _SCALE_TAIL_RE.match(value, match.end())
+        if tail:
+            attached = tail.group("attached")
+            word = tail.group("word")
+            if attached is not None:
+                # Attached form: the whole attached token must BE the scale word,
+                # so "M" (and the CJK "万") counts while "MLEU" does not. NFKC
+                # folds fullwidth Latin to ASCII first.
+                key = unicodedata.normalize("NFKC", attached).lower()
+                if key in _SCALE_SUFFIXES:
+                    scaled = number * _SCALE_SUFFIXES[key]
+            elif word and word.lower() in _SCALE_SUFFIXES:
+                scaled = number * _SCALE_SUFFIXES[word.lower()]
+        if scaled is not None:
+            forms.add(str(round(scaled)))
+            continue
+        forms.add(str(int(number)) if number.is_integer() else raw)
     return forms
 
 

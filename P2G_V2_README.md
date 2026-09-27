@@ -133,6 +133,20 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1 `
 .\.venv\Scripts\python.exe python_scripts\p2g_v2.py --metrics outputs\p2g_v2_output.json
 ```
 
+## 多轮评测（衡量方差，而不是单次结论）
+
+单次运行**无法区分系统性缺陷与采样噪声**——同一套代码在同一篇论文上，无据率实测可在 0.00–0.16 之间波动，10 题里有 7 题的答案在各轮之间不一致。因此任何"更准/更差"的结论都必须建立在多轮之上。
+
+```powershell
+# 对已存的运行结果重复「章节归纳 → 分组归纳 → 概述 → 10 问」N 次
+.\.venv\Scripts\python.exe python_scripts\multiround_eval.py `
+  outputs\_e_Attention_1706.03762.json outputs\_e_SegEarth-OV_CVPR2025.json --rounds 3
+```
+
+它复用已抽取的事实，只重跑非确定性的归纳/问答阶段——每轮变化的只有模型采样本身，且省下块抽取的调用。输出包括：逐轮指标、**均值±标准差与范围**、**每题答案的跨轮稳定性**、以及**数字-主体错配筛查**（供人工阅读的候选清单，不是判定）。逐轮明细写入 `outputs/eval/`。
+
+> 读法：先看标准差，再看均值。若两个配置的均值差小于各自的标准差，那点差异不构成证据。
+
 系统优先检索当前论文的 Abstract / Results / Discussion / Conclusion，降低 Related Work 对定量结论的干扰。模型返回空、伪造或不支持答案的事实 ID 时，程序只从本次问题的证据白名单中最多选择 3 条；仍无法支持时会直接使用已验证事实作保守答案。
 
 全局问答的证据审计按句子粒度执行：有证据的句子保留为答案，无证据的句子移入 `unsupported_claims` 供审查，不再因混入一句无证据内容而整条丢弃。"矛盾"问题不经过句子审计，直接把确定性数值矛盾与总览发现的矛盾合并列出，并对每条语句尝试匹配回事实以附带页码出处。
