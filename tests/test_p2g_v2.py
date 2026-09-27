@@ -79,6 +79,7 @@ from p2g_v2 import (  # noqa: E402
     report_evidence_metrics,
     _answer_sentences,
     _quantile,
+    _TABLE_HEADER_CONCEPT,
 )
 
 
@@ -856,6 +857,109 @@ class EvidenceMetricsTests(unittest.TestCase):
     def test_report_rejects_a_missing_file(self):
         with self.assertRaises(FileNotFoundError):
             report_evidence_metrics("does-not-exist.json")
+
+
+    def test_table_caption_is_emitted_once_not_per_row(self):
+        # The caption used to be spliced into every row's statement, repeating one
+        # sentence per row (measured: 55-69% of all table-fact tokens, the same
+        # caption up to 150 times). It must now appear in exactly one header fact.
+        section = flatten_sections(
+            build_heading_tree(
+                [
+                    PageMarkdown(
+                        page=3,
+                        text=(
+                            "# 5 Results\n"
+                            "**Table 2** Denoising results on SIDD\n"
+                            "|Model|PSNR|\n"
+                            "|---|---|\n"
+                            "|Baseline|39.85|\n"
+                            "|NAFNet|39.96|\n"
+                        ),
+                    )
+                ]
+            )
+        )[0]
+
+        facts = extract_table_facts(section)
+        headers = [f for f in facts if f.concept == _TABLE_HEADER_CONCEPT]
+        rows = [f for f in facts if f.concept != _TABLE_HEADER_CONCEPT]
+
+        self.assertEqual(1, len(headers))
+        self.assertEqual(2, len(rows))
+        self.assertIn("Denoising results on SIDD", headers[0].statement)
+        for row in rows:
+            self.assertNotIn("Denoising results on SIDD", row.statement)
+            self.assertEqual("Table 2", row.table)
+        # The caption is still carried on every fact as a field, for provenance.
+        self.assertTrue(all("Denoising results on SIDD" in f.table_caption for f in facts))
+
+    def test_table_header_is_not_emitted_for_a_config_only_table(self):
+        # A config table contributes no metric facts, so it must contribute no
+        # header fact either -- otherwise the header alone leaks into the DB.
+        section = flatten_sections(
+            build_heading_tree(
+                [
+                    PageMarkdown(
+                        page=5,
+                        text=(
+                            "# 8 Discussion\n"
+                            "**Table 8** Key configuration parameters\n"
+                            "|Setting|Value|\n"
+                            "|---|---|\n"
+                            "|max_seq_len|4096|\n"
+                        ),
+                    )
+                ]
+            )
+        )[0]
+        self.assertEqual([], extract_table_facts(section))
+
+    def test_table_row_metric_facts_are_compact(self):
+        # A row statement must be the row's own content, not a caption plus content.
+        section = flatten_sections(
+            build_heading_tree(
+                [
+                    PageMarkdown(
+                        page=3,
+                        text=(
+                            "# 5 Results\n"
+                            "**Table 6** Image Denoising Results on SIDD\n"
+                            "|Model|PSNR|\n"
+                            "|---|---|\n"
+                            "|NAFNet|40.30|\n"
+                        ),
+                    )
+                ]
+            )
+        )[0]
+        rows = [f for f in extract_table_facts(section) if f.concept != _TABLE_HEADER_CONCEPT]
+        self.assertEqual(1, len(rows))
+        # The row keeps its own context (Model=NAFNet) but never the caption.
+        self.assertIn("PSNR=40.30", rows[0].statement)
+        self.assertNotIn("Denoising", rows[0].statement)
+        self.assertEqual("Table 6", rows[0].table)
+
+    def test_retrieval_treats_explicit_table_field_as_a_table_row(self):
+        # The "Table N:" prefix used to drive this; statements no longer carry it,
+        # so the explicit field must count on its own.
+        row = {
+            "fact_id": "fact-tbl",
+            "concept": "#",
+            "statement": "#=1; Arcane Academy=0.42",
+            "kind": "metric",
+            "table": "Table 9",
+            "section_title": "5.2 Analysis",
+            "confidence": 1.0,
+        }
+        _, metric_allowed = build_question_request(
+            "使用了哪些评价指标？", [row], [], max_tokens=600
+        )
+        self.assertNotIn("fact-tbl", metric_allowed)
+        _, quant_allowed = build_question_request(
+            "最重要的定量结果是什么？", [row], [], max_tokens=600
+        )
+        self.assertIn("fact-tbl", quant_allowed)
 
 
 class UtilityTests(unittest.TestCase):

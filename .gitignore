@@ -27,6 +27,9 @@ htmlcov/
 # --- 运行产物（每次运行都会变，由脚本重新生成） ---
 outputs/
 
+# --- 本地待处理 PDF（受版权约束，不入库） ---
+inputs/
+
 # --- 操作系统 ---
 .DS_Store
 Thumbs.db

@@ -163,6 +163,10 @@ class TableFact(BaseModel):
     fact_id: str
     section_id: str
     table: str
+    # Full caption text, kept once per table (see `extract_table_facts`). It used to
+    # be spliced into every row's `statement`, which repeated the same sentence up
+    # to 150 times and consumed 55-69% of all table-fact tokens.
+    table_caption: str = ""
     row_context: dict[str, str]
     metric: str
     value: float
@@ -1464,7 +1468,22 @@ def _row_is_config_row(table: str, metric: str, row_context: dict[str, str]) -> 
     return generic_column and (config_marker or generic_context)
 
 
+# Concept label for the per-table header fact (see `extract_table_facts`).
+_TABLE_HEADER_CONCEPT = "表结构"
+
+
 def extract_table_facts(section: HeadingNode) -> list[TableFact]:
+    """One fact per numeric table cell, plus a single header fact per table.
+
+    The table caption is emitted **once** per table, in a `表结构` header fact, and
+    kept verbatim in `TableFact.table_caption`. It used to be spliced into every
+    row's `statement`, which repeated one sentence per row: measured on two real
+    runs that was 54.7% (NAFNet) and 69.1% (Agentopia) of all table-fact tokens,
+    with the same caption repeated up to 150 times. Since the retrieval layer
+    selects facts into a fixed token budget, that redundancy directly displaced
+    other evidence -- the 2200-token catalog filled at 99.6% capacity while 91% of
+    available facts were left out.
+    """
     page_texts = section.page_texts or [PageMarkdown(page=section.page_start, text=section.text)]
     facts: list[TableFact] = []
     for page_text in page_texts:
@@ -1476,6 +1495,19 @@ def extract_table_facts(section: HeadingNode) -> list[TableFact]:
                 for column in range(width)
                 if any(column < len(row) and _parse_numeric_cell(row[column]) for row in rows)
             }
+            if not numeric_columns:
+                # A textual table carries no metric values; a header fact alone
+                # would add noise without evidence.
+                continue
+            # Prefer the bare "Table N" label. A caption without a colon used to be
+            # swallowed whole, which put the caption back into every row's `table`
+            # field and undid the de-duplication this function exists to do.
+            label = re.match(r"(?i)\s*((?:table|\u8868)\s*\d+)\s*[:\uff1a]?", table)
+            table_id = label.group(1).strip() if label else table.strip()[:120]
+            table_id = table_id or table.strip()
+            column_names = [_clean_table_cell(name) for name in headers]
+            caption = table.strip()
+            table_facts: list[TableFact] = []
             carried: dict[int, str] = {}
             for row, source_quote in zip(rows, source_rows):
                 padded = [*row, *("" for _ in range(width - len(row)))]
@@ -1492,32 +1524,36 @@ def extract_table_facts(section: HeadingNode) -> list[TableFact]:
                     for column in range(width)
                     if column not in numeric_columns and cleaned[column]
                 }
-                if not row_context:
-                    continue
                 for column in numeric_columns:
                     parsed = _parse_numeric_cell(padded[column])
                     if not parsed:
                         continue
                     value, display_value, cell_unit = parsed
                     metric = headers[column]
+                    # Config detection still sees the full caption text, so marker
+                    # matching is unchanged.
                     if _row_is_config_row(table, metric, row_context):
                         # A config/parameter value is not an evaluation metric;
                         # keep it out of the fact DB entirely (the retrieval
                         # layer used to sink it after the fact).
                         continue
                     unit = "%" if "%" in metric or cell_unit == "%" else cell_unit
-                    context_text = "; ".join(f"{key}={value}" for key, value in row_context.items())
-                    statement = f"{table}: {context_text}; {metric}={display_value}{unit}"
+                    parts = [f"{key}={value}" for key, value in row_context.items()]
+                    parts.append(f"{metric}={display_value}{unit}")
+                    # The caption is NOT repeated here; it lives in the per-table
+                    # header fact below, which is what makes this compact.
+                    statement = "; ".join(parts)
                     raw_id = json.dumps(
                         [section.id, page_text.page, table, row_context, metric, display_value],
                         ensure_ascii=False,
                         sort_keys=True,
                     )
-                    facts.append(
+                    table_facts.append(
                         TableFact(
                             fact_id=f"fact-{hashlib.sha1(raw_id.encode('utf-8')).hexdigest()[:16]}",
                             section_id=section.id,
-                            table=table,
+                            table=table_id,
+                            table_caption=caption,
                             row_context=row_context,
                             metric=metric,
                             value=value,
@@ -1530,6 +1566,34 @@ def extract_table_facts(section: HeadingNode) -> list[TableFact]:
                             bold="**" in padded[column],
                         )
                     )
+            if not table_facts:
+                # Every row was a config row (or unparseable): emit nothing at all,
+                # including no header, so a config table stays absent from the DB.
+                continue
+            header_raw = json.dumps(
+                [section.id, page_text.page, "header", table_id], ensure_ascii=False, sort_keys=True
+            )
+            facts.append(
+                TableFact(
+                    fact_id=f"fact-{hashlib.sha1(header_raw.encode('utf-8')).hexdigest()[:16]}",
+                    section_id=section.id,
+                    table=table_id,
+                    table_caption=caption,
+                    row_context={},
+                    metric="",
+                    value=0.0,
+                    display_value="",
+                    statement=(
+                        f"{_TABLE_HEADER_CONCEPT}：{_prefix_for_budget(caption, 200)}；"
+                        f"列名：{'、'.join(name for name in column_names if name)}"
+                    ),
+                    source_quote=caption[:400],
+                    page=page_text.page,
+                    concept=_TABLE_HEADER_CONCEPT,
+                    confidence=1.0,
+                )
+            )
+            facts.extend(table_facts)
     return list({fact.fact_id: fact for fact in facts}.values())
 
 
@@ -3076,8 +3140,14 @@ def build_question_request(
         title = re.sub(r"[^a-z0-9\u3400-\u9fff]+", " ", str(fact.get("section_title", "")).lower())
         value = kind_relevance(fact)
         if fact.get("kind") == "metric":
+            # A row of a result/correlation table. Statements no longer carry a
+            # "Table N:" prefix (the caption moved to a single per-table header
+            # fact), so read the `table` field; the inline marker check keeps
+            # hand-built or legacy fact dicts working.
             statement_lower = str(fact.get("statement", "")).lstrip().lower()
-            table_row = re.match(r"table\s+\d+\s*[:\uff1a]", statement_lower) is not None
+            table_row = bool(str(fact.get("table", "")).strip()) or (
+                re.match(r"(?:table|\u8868)\s*\d*\s*[:\uff1a]", statement_lower) is not None
+            )
             generic_column = (
                 str(fact.get("concept", "")).strip().lower() in _GENERIC_METRIC_COLUMNS
             )
