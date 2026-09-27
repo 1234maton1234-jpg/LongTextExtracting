@@ -2260,6 +2260,112 @@ def _answer_metrics(answer: dict, fact_index: dict[str, dict]) -> dict:
     }
 
 
+# --- Backcheck of audited-unsupported sentences ----------------------------
+# `_audit_answer_claims` can only test a sentence against the facts that were
+# actually cited for that question. A sentence that IS grounded in the document
+# but whose fact the retrieval layer did not select is therefore reported as
+# "unsupported" -- measured on a real run, all four flagged sentences existed in
+# the fact DB, so the flag was a retrieval-coverage gap, not a fabrication.
+# The recheck re-tests each flagged sentence against the WHOLE fact index and
+# separates the two cases. It is a metric only: the gating behaviour of the
+# pipeline is unchanged.
+_VERDICT_RETRIEVAL_GAP = "retrieval_gap"
+_VERDICT_UNDECIDED = "undecided"
+
+# Coverage threshold for "the DB carries this content". Measured on real and
+# synthetic claims: a faithful paraphrase scores 0.76-0.90 and a claim stitching
+# three facts together scores 0.46, while a claim naming something with a
+# different word scores 0.00-0.17.
+#
+# Everything below the threshold is reported as `undecided`, NOT as fabricated.
+# Vocabulary overlap cannot separate a synonym ("加速比" where every fact says
+# "speedup") from an invented sentence -- both measure 0.00 -- so a fabrication
+# verdict would be a guess dressed up as a finding. `undecided` is therefore an
+# upper bound on fabrication: some of those claims are real content worded
+# differently. Resolving them needs the source document, which the run output
+# does not retain.
+_FACT_DB_COVERAGE_THRESHOLD = 0.4
+_FACT_DB_NUMBER_OVERLAP_THRESHOLD = 0.6
+
+
+def _claim_fact_db_coverage(
+    claim: str, fact_token_sets: list[tuple[set[str], set[str]]]
+) -> tuple[bool, float]:
+    """Return (numbers_agree, vocabulary_coverage) for `claim` against the DB.
+
+    Numbers are exactly what a paraphrase step corrupts, so agreement on them is
+    strong independent evidence that the content is real. Coverage accumulates
+    across facts so a claim that legitimately combines several facts still scores
+    well (best-single-fact overlap does not).
+    """
+    claim_tokens = _claim_tokens(claim)
+    if not claim_tokens:
+        return False, 0.0
+    claim_numbers = set(re.findall(r"\d+(?:\.\d+)?", claim))
+    numbers_agree = False
+    if claim_numbers:
+        for _fact_tokens, fact_numbers in fact_token_sets:
+            shared = claim_numbers & fact_numbers
+            if shared and (
+                len(shared) >= len(claim_numbers) * _FACT_DB_NUMBER_OVERLAP_THRESHOLD
+            ):
+                numbers_agree = True
+                break
+    covered: set[str] = set()
+    for fact_tokens, _fact_numbers in fact_token_sets:
+        covered |= claim_tokens & fact_tokens
+    return numbers_agree, len(covered) / len(claim_tokens)
+
+
+def _claim_matches_fact_db(
+    claim: str, fact_token_sets: list[tuple[set[str], set[str]]]
+) -> bool:
+    """True when the fact DB plausibly carries `claim`."""
+    numbers_agree, coverage = _claim_fact_db_coverage(claim, fact_token_sets)
+    return numbers_agree or coverage >= _FACT_DB_COVERAGE_THRESHOLD
+
+
+def _fact_token_sets(fact_index: dict[str, dict]) -> list[tuple[set[str], set[str]]]:
+    """Precompute (tokens, numbers) per fact once, so the recheck stays cheap."""
+    prepared = []
+    for fact in fact_index.values():
+        blob = " ".join(
+            str(fact.get(key, "")) for key in ("concept", "statement", "source_quote")
+        )
+        prepared.append(
+            (_claim_tokens(blob), set(re.findall(r"\d+(?:\.\d+)?", blob)))
+        )
+    return prepared
+
+
+def recheck_unsupported_claims(
+    unsupported: list[str], fact_token_sets: list[tuple[set[str], set[str]]]
+) -> list[dict]:
+    """Classify each audited-unsupported sentence against the whole fact DB.
+
+    Two verdicts, because the check genuinely cannot always decide:
+      * `retrieval_gap` -- the DB carries this content, so the pipeline had the
+        evidence and retrieval did not surface it. A recall problem, not an
+        accuracy one.
+      * `undecided` -- the DB shows no clear sign of it. This is an UPPER BOUND on
+        fabrication, not a finding: a sentence invented from nothing and a real
+        sentence worded with a synonym both score the same, so neither verdict
+        would be honest. Reported with its coverage so it can be triaged.
+    """
+    verdicts = []
+    for claim in unsupported:
+        text = str(claim).strip()
+        if not text or not _claim_tokens(text):
+            continue
+        numbers_agree, coverage = _claim_fact_db_coverage(text, fact_token_sets)
+        if numbers_agree or coverage >= _FACT_DB_COVERAGE_THRESHOLD:
+            verdict = _VERDICT_RETRIEVAL_GAP
+        else:
+            verdict = _VERDICT_UNDECIDED
+        verdicts.append({"claim": text, "verdict": verdict, "coverage": round(coverage, 3)})
+    return verdicts
+
+
 def _quantile(values: list[int], fraction: float) -> int:
     if not values:
         return 0
@@ -2300,6 +2406,16 @@ def run_evidence_metrics(
                     fact_index[str(fact["fact_id"])] = fact
 
     per_answer = [_answer_metrics(answer, fact_index) for answer in answers]
+
+    # Backcheck the audited-unsupported sentences against the whole fact DB, so a
+    # retrieval gap is not reported as if it were a fabrication.
+    fact_token_sets = _fact_token_sets(fact_index)
+    for item, answer in zip(per_answer, answers):
+        item["unsupported_claims"] = recheck_unsupported_claims(
+            [str(entry) for entry in (answer.get("unsupported_claims") or [])],
+            fact_token_sets,
+        )
+
     # Quantiles span every answer, including zero-evidence ones: excluding them
     # would hide the very case the metric exists to catch (an answer that cited
     # nothing would vanish from min/median/max instead of pulling min to 0).
@@ -2308,6 +2424,18 @@ def run_evidence_metrics(
     total_resolved = sum(item["resolvable_fact_count"] for item in per_answer)
     total_unsupported = sum(item["unsupported_claim_count"] for item in per_answer)
     total_sentences = sum(item["sentence_count"] for item in per_answer)
+    retrieval_gaps = sum(
+        1
+        for item in per_answer
+        for verdict in item["unsupported_claims"]
+        if verdict["verdict"] == _VERDICT_RETRIEVAL_GAP
+    )
+    undecided = sum(
+        1
+        for item in per_answer
+        for verdict in item["unsupported_claims"]
+        if verdict["verdict"] == _VERDICT_UNDECIDED
+    )
 
     return {
         "fact_count": len(fact_index),
@@ -2324,6 +2452,12 @@ def run_evidence_metrics(
         "unsupported_claim_rate": (
             round(total_unsupported / total_sentences, 4) if total_sentences else 0.0
         ),
+        # Of the audited-unsupported sentences: how many the fact DB actually
+        # carries (retrieval gap -- a recall problem), and how many it cannot
+        # account for (`undecided`, an UPPER BOUND on fabrication: it also contains
+        # real sentences worded with a synonym, which overlap cannot distinguish).
+        "unsupported_retrieval_gaps": retrieval_gaps,
+        "unsupported_undecided": undecided,
         "median_cited_facts": _quantile(counts, 0.5),
         "min_cited_facts": _quantile(counts, 0.0),
         "max_cited_facts": _quantile(counts, 1.0),
@@ -4138,6 +4272,11 @@ def report_evidence_metrics(output_path: str | Path) -> dict:
         f"unsupported_rate={metrics['unsupported_claim_rate']} "
         f"cited(min/median/max)={metrics['min_cited_facts']}/"
         f"{metrics['median_cited_facts']}/{metrics['max_cited_facts']}"
+    )
+    print(
+        f"unsupported breakdown: retrieval_gap={metrics['unsupported_retrieval_gaps']} "
+        f"undecided={metrics['unsupported_undecided']} "
+        f"(total {metrics['total_unsupported_claims']}; undecided bounds fabrication)"
     )
     print(f"\n{'#':>2} {'cited':>5} {'resolv':>6} {'suff':>5} {'sent':>4} "
           f"{'unsup':>5} {'pages':>5}  question")

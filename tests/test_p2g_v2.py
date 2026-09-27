@@ -80,6 +80,8 @@ from p2g_v2 import (  # noqa: E402
     _answer_sentences,
     _quantile,
     _TABLE_HEADER_CONCEPT,
+    _claim_matches_fact_db,
+    _claim_tokens,
 )
 
 
@@ -960,6 +962,130 @@ class EvidenceMetricsTests(unittest.TestCase):
             "最重要的定量结果是什么？", [row], [], max_tokens=600
         )
         self.assertIn("fact-tbl", quant_allowed)
+
+
+    def test_backcheck_separates_retrieval_gap_from_undecided(self):
+        # `_audit_answer_claims` only tests against the facts actually cited, so a
+        # sentence grounded in the document but not retrieved is reported as
+        # "unsupported". The backcheck re-tests it against the whole DB and marks
+        # what the DB carries as a retrieval gap.
+        results = [
+            self._section([
+                self._fact("f1", statement="窗口注意力仅在固定大小的局部窗口内应用自注意力，但缺乏全局信息。"),
+                self._fact("f2", statement="在256×256输入下，36块延迟39.1 ms。"),
+            ])
+        ]
+        synthesis = {
+            "global_answers": [
+                self._answer("Q1", "回答。", ["f1"], unsupported=[
+                    "窗口注意力缺乏全局信息；",
+                    "该模型在量子化学基准上取得了最优结果。",
+                ]),
+            ]
+        }
+
+        m = run_evidence_metrics(results, synthesis)
+        by_claim = {v["claim"]: v["verdict"] for v in m["per_answer"][0]["unsupported_claims"]}
+
+        self.assertEqual("retrieval_gap", by_claim["窗口注意力缺乏全局信息；"])
+        self.assertEqual(1, m["unsupported_retrieval_gaps"])
+        self.assertEqual(1, m["unsupported_undecided"])
+
+    def test_backcheck_never_claims_fabrication(self):
+        # A synonym and an invented sentence both score 0.00 on vocabulary overlap,
+        # so the check must not label either one fabricated. `undecided` is an
+        # upper bound on fabrication, not a verdict.
+        results = [
+            self._section([self._fact("f1", statement="column_1=NAFNet; speedup=1.09×; SIDD PSNR=39.96")])
+        ]
+        synthesis = {
+            "global_answers": [
+                self._answer("Q1", "回答。", ["f1"], unsupported=[
+                    "消融中还涉及加速比。",              # synonym for "speedup"
+                    "该模型在量子化学基准上取得了最优结果。",  # invented
+                ])
+            ]
+        }
+
+        m = run_evidence_metrics(results, synthesis)
+        verdicts = m["per_answer"][0]["unsupported_claims"]
+
+        self.assertEqual(2, m["unsupported_undecided"])
+        self.assertEqual(0, m["unsupported_retrieval_gaps"])
+        self.assertTrue(all(v["verdict"] == "undecided" for v in verdicts))
+        # The coverage is reported so the case can be triaged by hand.
+        self.assertTrue(all("coverage" in v for v in verdicts))
+
+    def test_backcheck_accepts_a_claim_that_combines_several_facts(self):
+        # A claim stitching three facts together has low overlap with any single
+        # fact; coverage must accumulate across facts or it would look fabricated.
+        results = [
+            self._section([
+                self._fact("f1", statement="窗口注意力缺乏全局信息。"),
+                self._fact("f2", statement="通道注意力聚合全局信息与通道交互。"),
+                self._fact("f3", statement="局部增强前馈网络增强局部信息捕获能力。"),
+            ])
+        ]
+        synthesis = {
+            "global_answers": [
+                self._answer("Q1", "回答。", ["f1"], unsupported=[
+                    "还涉及通道注意力、窗口多头自注意力、局部增强前馈网络等已有方法。"
+                ])
+            ]
+        }
+
+        m = run_evidence_metrics(results, synthesis)
+
+        self.assertEqual("retrieval_gap", m["per_answer"][0]["unsupported_claims"][0]["verdict"])
+
+    def test_backcheck_uses_number_agreement_as_evidence(self):
+        # A numeric claim whose numbers all appear in one fact is real content even
+        # when the wording is entirely different.
+        results = [
+            self._section([
+                self._fact("f1", statement="该配置的数值为 40.30 与 0.28。"),
+            ])
+        ]
+        synthesis = {
+            "global_answers": [
+                self._answer("Q1", "回答。", ["f1"], unsupported=["指标达到了 40.30，提升 0.28。"])
+            ]
+        }
+
+        m = run_evidence_metrics(results, synthesis)
+
+        self.assertEqual("retrieval_gap", m["per_answer"][0]["unsupported_claims"][0]["verdict"])
+
+    def test_backcheck_breakdown_sums_to_total_unsupported(self):
+        results = [
+            self._section([self._fact("f1", statement="窗口注意力缺乏全局信息。")])
+        ]
+        synthesis = {
+            "global_answers": [
+                self._answer("Q1", "回答。", ["f1"], unsupported=[
+                    "窗口注意力缺乏全局信息。",
+                    "完全无关的量子化学结论。",
+                ])
+            ]
+        }
+
+        m = run_evidence_metrics(results, synthesis)
+
+        self.assertEqual(
+            m["total_unsupported_claims"],
+            m["unsupported_retrieval_gaps"] + m["unsupported_undecided"],
+        )
+
+    def test_claim_matches_fact_db_threshold_behaviour(self):
+        # Directly pin the boundary so a future tuning change is deliberate.
+        facts = [(_claim_tokens("窗口注意力仅在局部窗口内应用自注意力，但缺乏全局信息。"), set())]
+
+        # A close paraphrase clears the threshold.
+        self.assertTrue(_claim_matches_fact_db("窗口注意力缺乏全局信息。", facts))
+        # Unrelated wording does not, and must not be called fabricated elsewhere.
+        self.assertFalse(_claim_matches_fact_db("量子化学基准上的最优结果。", facts))
+        # An empty claim carries no evidence either way.
+        self.assertFalse(_claim_matches_fact_db("", facts))
 
 
 class UtilityTests(unittest.TestCase):
