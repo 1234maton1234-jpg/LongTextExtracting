@@ -16,7 +16,7 @@
 - 多篇不同形态的 PDF（实验论文、英文综述、结构较乱的中译综述）全流程实测：10 项全局问答**句子级审计零无据陈述**、零英文泄漏、答案带可定位页码出处、"矛盾"问题可溯源。
   > 注意口径：句子级审计验证的是"这句话能否在引用的事实里找到依据"（grounding），**不验证答案是否切题**（relevance）。一条完全答非所问但确有原文依据的句子同样会通过审计。指标类问题的答非所问已由正文兜底路径修复；其余问题类别仍需人工抽查切题性。
 - 截断与恢复：抽取与归纳阶段实测 0 截断、0 恢复调用；reduce 族 reasoning token 由约 134K 降至约 0.3K（仅总览保留思考），总 token 降幅约 34%。
-- 单元测试 **103 个全部通过**。
+- 单元测试 **176 个全部通过**。
 
 ## 仍存在的问题
 
@@ -27,7 +27,7 @@
 ## 环境要求
 
 - Windows 10/11
-- 64 位 Python 3.10-3.12
+- 64 位 Python 3.10-3.13
 - 可访问 DeepSeek API
 - 自己的 DeepSeek API Key
 
@@ -42,7 +42,7 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 powershell -ExecutionPolicy Bypass -File .\test.ps1
 ```
 
-预期结果为 `103 tests ... OK`。
+预期结果为 `176 tests ... OK`。
 
 ## 先做免费 Dry Run
 
@@ -93,6 +93,9 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1 `
 - 定量回答中的数字是否与对应事实完全一致。
 - `contradictions` 是否能发现跨页数字或结论冲突。
 - `stats.usage` 可查看**本次运行**的请求数、Token 和耗时（含 `run_started_at` 起始时间戳）；`stats.all_time_usage` 是 usage 数据库的**历史累计**值。两者分开统计——usage 库是追加共享的，早先版本把累计值当成本次运行数据，会严重高估单次成本。`stats.cache` 的 `hits`/`misses` 本身就是本次运行的计数。
+- `stats.config` 给出超时与重试配置：`request_timeout_seconds`、`sdk_max_retries`、`content_retry_attempts`，以及最坏情况乘积 `max_attempts_per_request`（SDK 重试与应用层重试会**相乘**）。
+
+> ⚠️ **`latency_seconds` 的含义**：它是**每次 API 调用的净耗时**，**不含**并发信号量排队等待。早先版本把时钟起点放在获取信号量**之前**，导致该字段混入排队时间：实测同一 stage 的吞吐（tok/s）在修正前后相差一个数量级（`document_group_reduce` 62.6 → 1087 tok/s，Token 数几乎相同）。因此**修正前的 latency 数据不能用来判断"哪个阶段慢"**，据此推断超时风险也不可靠。修正后在 NAFNet 全篇实测：80 次调用、单次最长 **8.52s**、延迟合计 241.8s、**0 次**触及 120s 超时。
 
 ## 溯源指标（可回归的质量度量）
 

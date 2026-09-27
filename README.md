@@ -7,7 +7,7 @@
 ## 环境要求
 
 - Windows 10/11
-- 64 位 Python 3.10-3.12
+- 64 位 Python 3.10-3.13
 - 自己的 DeepSeek API Key
 
 ## 快速开始
@@ -20,7 +20,7 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 Copy-Item .env.example .env
 # 然后编辑 .env，把 DEEPSEEK_API_KEY 改成你自己的（示例文件里已写好注释）
 
-# 3. 跑测试确认环境正常（103 个应全部通过）
+# 3. 跑测试确认环境正常（176 个应全部通过）
 powershell -ExecutionPolicy Bypass -File .\test.ps1
 
 # 4. 运行（处理一份 PDF）

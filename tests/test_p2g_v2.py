@@ -627,6 +627,64 @@ class ConceptMemoryTests(unittest.TestCase):
         # relies on substring semantics here.
         self.assertTrue(_alias_occurs_in("支持向量机", "支持向量机器"))
 
+    def test_purge_unowned_removes_legacy_rows_and_their_children(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            memory = ConceptMemory(Path(temp_dir) / "memory.sqlite3")
+            # One legacy (unowned) concept with an occurrence, one owned concept.
+            memory.upsert("Legacy", section_id="s-old", page=3, source_quote="q")
+            memory.upsert("Owned", document_key="doc-a", section_id="s-new", page=1)
+
+            self.assertEqual(2, memory.count())
+            result = memory.purge_unowned()
+
+            self.assertEqual(1, result["concepts_deleted"])
+            self.assertEqual(1, result["occurrences_deleted"])
+            self.assertGreaterEqual(result["aliases_deleted"], 1)
+            self.assertEqual(1, memory.count())
+            # The legacy concept is gone from every table, not just `concepts`.
+            self.assertEqual(
+                0,
+                memory.connection.execute(
+                    "SELECT COUNT(*) FROM concepts WHERE document_key = ''"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                0,
+                memory.connection.execute(
+                    "SELECT COUNT(*) FROM occurrences WHERE section_id = 's-old'"
+                ).fetchone()[0],
+            )
+            # The owned concept survives and is still retrievable.
+            self.assertEqual(
+                1, len(memory.retrieve("Owned", document_key="doc-a"))
+            )
+            memory.close()
+
+    def test_purge_unowned_is_a_noop_when_everything_is_owned(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            memory = ConceptMemory(Path(temp_dir) / "memory.sqlite3")
+            memory.upsert("Owned", document_key="doc-a")
+
+            result = memory.purge_unowned()
+
+            self.assertEqual(0, result["concepts_deleted"])
+            self.assertEqual(1, memory.count())
+            memory.close()
+
+    def test_purge_unowned_clears_cross_document_leak(self):
+        # The purge exists because unowned rows were returned for ANY lookup,
+        # which is the cross-document leak. After it, an unscoped lookup of a
+        # legacy concept finds nothing.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            memory = ConceptMemory(Path(temp_dir) / "memory.sqlite3")
+            memory.upsert("Agentopia")
+
+            self.assertEqual(1, len(memory.retrieve("Agentopia is a simulator")))
+            memory.purge_unowned()
+
+            self.assertEqual([], memory.retrieve("Agentopia is a simulator"))
+            memory.close()
+
     def test_multi_word_alias_requires_all_tokens_adjacent(self):
         # A multi-word concept's alias key is glued into one word, so it must not
         # match a partial phrase. This strictness is what suppresses retrieval noise.
@@ -2576,6 +2634,26 @@ class UsageTrackerTests(unittest.TestCase):
             pipeline.usage.close()
             pipeline.cache.close()
 
+    def test_stats_reports_retry_configuration(self):
+        # A slow or expensive run must be explainable without reading the code, so
+        # the retry/timeout settings and their worst-case product are surfaced.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pipeline = LongDocumentPipeline.__new__(LongDocumentPipeline)
+            pipeline.usage = UsageTracker(Path(temp_dir) / "usage.sqlite3")
+            pipeline.cache = ResultCache(Path(temp_dir) / "cache.sqlite3")
+            pipeline.request_timeout_seconds = 120.0
+            pipeline.sdk_max_retries = 3
+            pipeline.content_retry_attempts = 3
+
+            config = pipeline.stats()["config"]
+
+            self.assertEqual(120.0, config["request_timeout_seconds"])
+            self.assertEqual(3, config["sdk_max_retries"])
+            self.assertEqual(3, config["content_retry_attempts"])
+            self.assertEqual(9, config["max_attempts_per_request"])
+            pipeline.usage.close()
+            pipeline.cache.close()
+
     def test_response_request_id_prefers_sdk_id_attribute(self):
         # Real SDK responses carry `id`. The old code read `_request_id`, which no
         # SDK object defines, so the usage column was always empty.
@@ -3277,6 +3355,91 @@ class RequestRetryTests(unittest.IsolatedAsyncioTestCase):
         pipeline.memory.close()
         await self._cleanup_usage(pipeline)
         shutil.rmtree(self._extract_dir, ignore_errors=True)
+
+    async def test_recorded_latency_excludes_semaphore_queueing(self):
+        # The clock must start after the semaphore is acquired. Starting it before
+        # charged every row for concurrency queueing, which inflated reported
+        # latency and made slow-stage conclusions unreliable.
+        import time as _time
+
+        class SlowCompletions:
+            async def create(self, **kwargs):
+                await asyncio.sleep(0.05)
+                return SimpleNamespace(
+                    id="req-1",
+                    choices=[SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"summary":"s","facts":[],"new_concepts":[]}'
+                        ),
+                        finish_reason="stop",
+                    )],
+                    usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+                )
+
+        self._usage_dir = tempfile.mkdtemp()
+        pipeline = LongDocumentPipeline.__new__(LongDocumentPipeline)
+        pipeline.client = SimpleNamespace(chat=SimpleNamespace(completions=SlowCompletions()))
+        pipeline.semaphore = asyncio.Semaphore(1)
+        pipeline.usage = UsageTracker(Path(self._usage_dir) / "usage.sqlite3")
+        pipeline.content_retry_attempts = 1
+        pipeline.content_retry_base_seconds = 0
+        pipeline.truncation_recovery_attempts = 1
+        pipeline.document_key = ""
+
+        # Occupy the semaphore so the request must queue first.
+        await pipeline.semaphore.acquire()
+
+        async def release_later():
+            await asyncio.sleep(0.15)
+            pipeline.semaphore.release()
+
+        asyncio.ensure_future(release_later())
+
+        started = _time.perf_counter()
+        await pipeline._request_json(
+            "chunk_extract", "flash", "sys", "user", response_model=ChunkExtraction
+        )
+        wall = _time.perf_counter() - started
+
+        recorded = pipeline.usage.connection.execute(
+            "SELECT latency_seconds FROM usage"
+        ).fetchone()[0]
+        # Wall time includes the queue; the recorded latency must not.
+        self.assertGreater(wall, 0.15, "test did not actually queue")
+        self.assertLess(recorded, 0.12, f"latency leaked queue time: {recorded}")
+        self.assertGreater(recorded, 0.0)
+        await self._cleanup_usage(pipeline)
+
+    async def test_recovery_calls_record_a_duration_not_a_timestamp(self):
+        # Regression guard: after `_record_usage` switched from taking a start
+        # timestamp to taking an elapsed duration, two recovery call sites kept
+        # passing `started`, so their rows recorded ~7,000,000 seconds. Every
+        # call site must record a plausible duration.
+        valid = {"summary": "摘要", "facts": [], "new_concepts": []}
+        pipeline, completions = await self._make_recovery_pipeline(
+            [("length", '{"summary":"部分'), ("stop", json.dumps(valid, ensure_ascii=False))]
+        )
+
+        await pipeline._request_json(
+            "chunk_extract", "flash", "system", "user", response_model=ChunkExtraction
+        )
+
+        rows = pipeline.usage.connection.execute(
+            "SELECT stage, latency_seconds FROM usage"
+        ).fetchall()
+        self.assertGreaterEqual(len(rows), 2, "expected a main call plus a recovery call")
+        # The point of the test is the recovery path, so require it to have run.
+        stages = {stage for stage, _ in rows}
+        self.assertTrue(
+            any(stage.endswith("_cont") or stage.endswith("_regen") for stage in stages),
+            f"recovery path not exercised; stages={stages}",
+        )
+        for stage, latency in rows:
+            with self.subTest(stage=stage):
+                # A real API call is seconds, never the value of perf_counter().
+                self.assertGreaterEqual(latency, 0.0)
+                self.assertLess(latency, 600.0, f"{stage} recorded {latency}s")
+        await self._cleanup_usage(pipeline)
 
     async def test_extract_chunk_initial_call_thinks_off(self):
         # The first flash extraction call must not burn the output budget on

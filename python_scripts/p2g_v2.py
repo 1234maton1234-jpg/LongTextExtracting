@@ -1111,6 +1111,48 @@ class ConceptMemory:
     def count(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM concepts").fetchone()[0])
 
+    def purge_unowned(self) -> dict:
+        """Delete concepts that belong to no document (`document_key = ''`).
+
+        Rows written before document scoping existed carry no owner, so `retrieve`
+        without a `document_key` still returns them -- which is exactly the
+        cross-document leak the scoping was added to stop. Measured on the real
+        memory DB: 1499 of 1596 concepts were unowned, so scoping only protected
+        documents processed after the change.
+
+        The DB is a rebuildable cache, so the default remedy is to drop the unowned
+        rows and let the next run repopulate them under a real document key.
+        `occurrences` rows for removed concepts go too, else they orphan.
+        """
+        concept_ids = [
+            row["id"]
+            for row in self.connection.execute(
+                "SELECT id FROM concepts WHERE document_key = ''"
+            )
+        ]
+        if not concept_ids:
+            return {"concepts_deleted": 0, "occurrences_deleted": 0, "aliases_deleted": 0}
+        placeholders = ",".join("?" for _ in concept_ids)
+        occurrences = self.connection.execute(
+            f"DELETE FROM occurrences WHERE concept_id IN ({placeholders})", concept_ids
+        ).rowcount
+        aliases = self.connection.execute(
+            f"DELETE FROM aliases WHERE concept_id IN ({placeholders})", concept_ids
+        ).rowcount
+        self.connection.execute(
+            f"DELETE FROM concepts WHERE id IN ({placeholders})", concept_ids
+        )
+        self.connection.commit()
+        # SQLite keeps freed pages in the file, so without this the DB stays the
+        # same size on disk after deleting almost everything.
+        self.connection.execute("VACUUM")
+        self.connection.commit()
+        return {
+            "concepts_deleted": len(concept_ids),
+            "occurrences_deleted": occurrences,
+            "aliases_deleted": aliases,
+        }
+
     def close(self) -> None:
         self.connection.close()
 
@@ -3354,11 +3396,19 @@ class LongDocumentPipeline:
         document_title: str | None = None,
         document_key: str = "",
     ):
+        # Retry layers multiply: the SDK retries transport/5xx/429 errors
+        # `sdk_max_retries` times, and the application retries invalid structured
+        # output `content_retry_attempts` times on top. Worst case for one logical
+        # request is therefore sdk_max_retries * content_retry_attempts attempts,
+        # plus the truncation-recovery calls. Keep both visible instead of letting
+        # the product be a hidden constant.
+        self.sdk_max_retries = 3
+        self.request_timeout_seconds = 120.0
         self.client = AsyncOpenAI(
             api_key=api_key,
             base_url="https://api.deepseek.com",
-            timeout=120.0,
-            max_retries=3,
+            timeout=self.request_timeout_seconds,
+            max_retries=self.sdk_max_retries,
         )
         self.memory = ConceptMemory(memory_path)
         self.cache = ResultCache(cache_path)
@@ -3541,8 +3591,12 @@ class LongDocumentPipeline:
         recovery_attempts = getattr(self, "truncation_recovery_attempts", 3)
         last_error: Exception | None = None
         for attempt in range(self.content_retry_attempts):
-            started = time.perf_counter()
             async with self.semaphore:
+                # Time only the API call. Starting the clock before acquiring the
+                # semaphore charged this row for concurrency queueing as well, which
+                # inflated every reported latency and made "slow stage" conclusions
+                # unreliable (measured: rows over 200s where the call itself was not).
+                started = time.perf_counter()
                 response = await self.client.chat.completions.create(
                     model=model,
                     messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -3551,7 +3605,8 @@ class LongDocumentPipeline:
                     max_tokens=max_output_tokens,
                     reasoning_effort=reasoning_effort,
                 )
-            self._record_usage(stage, model, response, started)
+                elapsed = time.perf_counter() - started
+            self._record_usage(stage, model, response, elapsed)
             try:
                 choice = response.choices[0]
                 content = self._normalize_choice_content(choice)
@@ -3603,8 +3658,13 @@ class LongDocumentPipeline:
             f"{stage} returned invalid structured output after {self.content_retry_attempts} attempts"
         ) from last_error
 
-    def _record_usage(self, stage: str, model: str, response: object, started: float) -> None:
-        elapsed = time.perf_counter() - started
+    def _record_usage(self, stage: str, model: str, response: object, elapsed: float) -> None:
+        """Record one API call.
+
+        `elapsed` must already be the call duration (the caller starts the clock
+        after acquiring the semaphore); this function does not time anything itself
+        so a caller cannot accidentally include queueing again.
+        """
         usage = getattr(response, "usage", None)
         self.usage.record(
             stage,
@@ -3612,7 +3672,7 @@ class LongDocumentPipeline:
             int(getattr(usage, "prompt_tokens", 0) or 0),
             int(getattr(usage, "completion_tokens", 0) or 0),
             int(getattr(usage, "total_tokens", 0) or 0),
-            elapsed,
+            max(0.0, float(elapsed)),
             _response_request_id(response),
         )
 
@@ -3654,8 +3714,8 @@ class LongDocumentPipeline:
             {"role": "assistant", "content": partial},
             {"role": "user", "content": cont_user},
         ]
-        started = time.perf_counter()
         async with self.semaphore:
+            started = time.perf_counter()
             cont_resp = await self.client.chat.completions.create(
                 model=model,
                 messages=messages,
@@ -3664,7 +3724,8 @@ class LongDocumentPipeline:
                 max_tokens=min(max_output_tokens * 2, 4096),
                 reasoning_effort="none",
             )
-        self._record_usage(stage + "_cont", model, cont_resp, started)
+            elapsed = time.perf_counter() - started
+        self._record_usage(stage + "_cont", model, cont_resp, elapsed)
         cont_choice = getattr(cont_resp, "choices", [None])[0]
         cont_content = self._message_content(cont_resp)
         self._log_model_response(stage + "_cont", model, 0, cont_resp, cont_choice, cont_content)
@@ -3688,8 +3749,8 @@ class LongDocumentPipeline:
     ) -> tuple[dict | None, object]:
         """Re-issue the full JSON request with thinking off so the whole output
         budget goes to content. Returns (payload, response)."""
-        started = time.perf_counter()
         async with self.semaphore:
+            started = time.perf_counter()
             regen_resp = await self.client.chat.completions.create(
                 model=model,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -3698,7 +3759,8 @@ class LongDocumentPipeline:
                 max_tokens=max(2048, max_output_tokens),
                 reasoning_effort="none",
             )
-        self._record_usage(stage + "_regen", model, regen_resp, started)
+            elapsed = time.perf_counter() - started
+        self._record_usage(stage + "_regen", model, regen_resp, elapsed)
         self._log_model_response(
             stage + "_regen", model, 0, regen_resp, getattr(regen_resp, "choices", [None])[0], None
         )
@@ -4121,7 +4183,19 @@ source_fact_ids 必须来自 fact_catalog；章节和页码留空，由程序反
             "usage": self.usage.summary(),
             "all_time_usage": self.usage.all_time_summary(),
             "cache": self.cache.summary(),
-            "group_fallbacks": self.group_fallbacks,
+            "group_fallbacks": getattr(self, "group_fallbacks", 0),
+            # Retry/timeout configuration, so a slow or expensive run can be
+            # explained without reading the code. `latency_seconds` in `usage` is
+            # per API call and EXCLUDES semaphore queueing.
+            "config": {
+                "request_timeout_seconds": getattr(self, "request_timeout_seconds", None),
+                "sdk_max_retries": getattr(self, "sdk_max_retries", None),
+                "content_retry_attempts": getattr(self, "content_retry_attempts", None),
+                "max_attempts_per_request": (
+                    getattr(self, "sdk_max_retries", 0)
+                    * getattr(self, "content_retry_attempts", 0)
+                ),
+            },
         }
 
     async def process_section(
@@ -4414,7 +4488,21 @@ def main() -> None:
         help="Print provenance metrics for an existing run output and exit "
         "(no PDF or API key needed).",
     )
+    parser.add_argument(
+        "--purge-unowned-memory",
+        action="store_true",
+        help="Delete concept-memory rows that belong to no document (written before "
+        "document scoping existed), then exit. These rows leak across documents.",
+    )
     args = parser.parse_args()
+    if args.purge_unowned_memory:
+        memory = ConceptMemory(args.memory_db)
+        try:
+            result = memory.purge_unowned()
+            print(f"purged unowned memory rows: {result}")
+        finally:
+            memory.close()
+        return
     if args.metrics:
         report_evidence_metrics(args.metrics)
         return
