@@ -182,7 +182,11 @@ async def run_rounds(
         mispair = screen_mispairings(dumped, index)
         record = {
             "round": rnd,
-            "metrics": {k: v for k, v in metrics.items() if k != "per_answer"},
+            # `per_answer` is kept on purpose. Without the sentence counts a change in
+            # the headline rate cannot be split into "more unsupported sentences" versus
+            # "fewer sentences overall", and the latter moves this ratio with no quality
+            # change at all (a shorter answer is penalised for being short).
+            "metrics": metrics,
             "mispair_candidates": mispair,
             "answers": {a["question"]: a["answer"] for a in dumped["global_answers"]},
             "overview": {
