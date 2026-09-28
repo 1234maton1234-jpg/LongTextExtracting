@@ -1880,6 +1880,48 @@ _METRIC_SECTION_RE = re.compile(
     r"(?i)metric|evaluation|indicator|score|评价|评估|指标|度量"
 )
 
+# --- Future-work routing -----------------------------------------------------
+# The future-work route used to admit any `limitation`/`result` fact, so it answered
+# with ordinary limitations lifted from the Abstract and Introduction and never
+# surfaced what the paper actually proposed to do next. Measured: "未来工作或改进
+# 方向是什么？" cited only Introduction/Background limitation facts on the
+# Attention and SegEarth papers, while both papers state real future directions
+# ("作者计划将 Transformer 扩展到涉及文本以外的模态").
+#
+# The reliable signal is that the SOURCE frames the item as open or planned. A
+# section-title gate alone is wrong: real future directions also appear outside
+# conclusion sections, and a conclusion section mostly restates past results.
+# Two deliberate exclusions learned from measurement:
+#   * bare `open` would match "open access", "open vocabulary", "OpenStreetMap";
+#   * a mid-paper "we leave X for later" ("本文剩余部分…白粉模型…需要单独证明") is
+#     scoping, not future work, so it is only boosted when its section is
+#     forward-looking as well.
+# Only high-precision phrasings survive here. Measured false positives that were
+# dropped after checking real runs: "可证明 MambaIRv2 的有效性" and "可推广到一般 k"
+# are statements about the present, "we expect Tracy-Widom" is a prediction, and
+# "筛选出14个基因进行进一步研究" is a methods sentence describing finished work.
+_FORWARD_ITEM_RE = re.compile(
+    r"(?i)open\s+(?:problem|question)s?"
+    r"|we\s+(?:leave|plan|hope|intend)"
+    r"|future\s+(?:work|direction|research|study)"
+    r"|remains?\s+(?:un|to be|an?\s+open)"
+    r"|作者计划|计划(?:将|研究)|开放问题|尚不清楚|尚待|尚未|有待|留(?:作|待|给)"
+    r"|未来(?:工作|方向|研究)"
+)
+_FORWARD_TITLE_RE = re.compile(
+    r"(?i)future|open\s+(?:problem|question)|conclusion|outlook|"
+    r"展望|未来|结论|开放问题|后续"
+)
+
+
+def _forward_work_boost(fact: dict) -> int:
+    """Score bonus for a fact the document states as open, planned or upcoming."""
+    blob = f"{fact.get('statement', '')} {fact.get('source_quote', '')}"
+    if not _FORWARD_ITEM_RE.search(blob):
+        return 0
+    title = str(fact.get("section_title", ""))
+    return 70 if _FORWARD_TITLE_RE.search(title) else 25
+
 
 def _metric_evidenced_dict(fact: dict) -> bool:
     """`metric_fact_is_evidenced` for catalogue dicts, without constructing a Fact.
@@ -3629,11 +3671,18 @@ def build_question_request(
             future_route
             and has_limitation_or_result
             and fact.get("kind") not in {"limitation", "result"}
+            and _forward_work_boost(fact) == 0
         ):
             # Hard exclusion: a future-work answer may only cite limitation or
-            # result facts. Zero here is absolute -- the selection loop drops any
-            # fact with score <= 0, so no keyword/section bonus can rescue a
-            # method-implementation fact into the catalog.
+            # result facts -- UNLESS the source states the item as open/planned.
+            # That exemption matters: the extracted kind is not reliable here.
+            # Measured on the Attention paper, its two genuine future directions
+            # ("作者计划将 Transformer 扩展到涉及文本以外的模态") were stored as
+            # `kind="method"`, so the unexempted gate dropped them before the
+            # boost could apply -- which is why the answer fell back to ordinary
+            # limitations from the Introduction. Zero here is absolute: the
+            # selection loop rejects score <= 0, so no keyword or section bonus can
+            # rescue an implementation detail.
             return 0, float(fact.get("confidence", 0.0))
         text = f"{fact.get('concept', '')} {fact.get('statement', '')}".lower()
         title = re.sub(r"[^a-z0-9\u3400-\u9fff]+", " ", str(fact.get("section_title", "")).lower())
@@ -3680,6 +3729,8 @@ def build_question_request(
             if any(term in title for term in ("related work", "literature", "background", "相关工作", "文献综述", "背景")):
                 value -= 40
         value += section_relevance(fact)
+        if future_route:
+            value += _forward_work_boost(fact)
         return value, float(fact.get("confidence", 0.0))
 
     ranked = sorted(fact_catalog, key=score, reverse=True)
