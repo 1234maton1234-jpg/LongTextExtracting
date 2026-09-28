@@ -3723,6 +3723,7 @@ class LongDocumentPipeline:
         extract_max_output_tokens: int = 4096,
         reduce_max_output_tokens: int = 2200,
         document_max_output_tokens: int = 3000,
+        group_batch_tokens: int = 9600,
         document_title: str | None = None,
         document_key: str = "",
     ):
@@ -3734,6 +3735,10 @@ class LongDocumentPipeline:
         # the product be a hidden constant.
         self.sdk_max_retries = 3
         self.request_timeout_seconds = 120.0
+        # Batch budget for the hierarchical group-reduce. Must stay well above the
+        # per-shard budget (see `synthesize_document`) or the hierarchy degenerates
+        # into one call per section.
+        self.group_batch_tokens = max(1000, group_batch_tokens)
         self.client = AsyncOpenAI(
             api_key=api_key,
             base_url="https://api.deepseek.com",
@@ -4383,7 +4388,17 @@ source_fact_ids 必须来自 fact_catalog；章节和页码留空，由程序反
             for shard in shard_section_evidence(section, max_tokens)
         ]
         self._document_fact_index = _build_fact_index(evidence)
-        batches = batch_by_token_budget(evidence, max_tokens)
+        # The batch budget must exceed the shard budget, or the hierarchy cannot
+        # group anything: a shard is capped AT max_tokens, so several shards can
+        # never fit under that same cap. Measured on a 48-page paper, batching at
+        # max_tokens produced 27 batches for 28 shards -- effectively one API call
+        # per section, re-summarising content the section_reduce had already
+        # summarised, and consuming 68% of all group-reduce calls. Each shard is
+        # read exactly once whatever the batch size, so widening the batch lowers
+        # the call count without raising input tokens: 3200 -> 31 calls,
+        # 9600 -> 8 calls, 12800 -> 6 calls, at ~62.2k input tokens either way.
+        group_budget = max(max_tokens, getattr(self, "group_batch_tokens", max_tokens))
+        batches = batch_by_token_budget(evidence, group_budget)
         groups = await asyncio.gather(
             *(self._reduce_group(batch, 0, index) for index, batch in enumerate(batches))
         )
@@ -4391,11 +4406,11 @@ source_fact_ids 必须来自 fact_catalog；章节和页码留空，由程序反
         while (
             len(groups) > 1
             and estimate_tokens(json.dumps([group.model_dump() for group in groups], ensure_ascii=False))
-            > max_tokens
+            > group_budget
             and level <= 4
         ):
             group_dicts = [group.model_dump() for group in groups]
-            batches = batch_by_token_budget(group_dicts, max_tokens)
+            batches = batch_by_token_budget(group_dicts, group_budget)
             groups = await asyncio.gather(
                 *(self._reduce_group(batch, level, index) for index, batch in enumerate(batches))
             )
@@ -4740,6 +4755,7 @@ async def _run(args: argparse.Namespace) -> None:
         concurrency=args.concurrency,
         content_retry_attempts=args.content_retries,
         content_retry_base_seconds=args.retry_base_seconds,
+        group_batch_tokens=args.group_batch_tokens,
         extract_max_output_tokens=args.extract_max_output_tokens,
         reduce_max_output_tokens=args.reduce_max_output_tokens,
         document_max_output_tokens=args.document_max_output_tokens,
@@ -4813,6 +4829,14 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-document-reduce", action="store_true")
     parser.add_argument("--reduce-max-tokens", type=int, default=3200)
+    parser.add_argument(
+        "--group-batch-tokens",
+        type=int,
+        default=9600,
+        help="Token budget per hierarchical group-reduce call. Must exceed "
+             "--reduce-max-tokens, otherwise the hierarchy issues one call per "
+             "section and the call count roughly triples.",
+    )
     parser.add_argument("--flash-model", default="deepseek-v4-flash")
     parser.add_argument("--pro-model", default="deepseek-v4-pro")
     parser.add_argument("--concurrency", type=int, default=4)
