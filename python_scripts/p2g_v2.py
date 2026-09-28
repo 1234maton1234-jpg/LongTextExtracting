@@ -1788,6 +1788,131 @@ def _metric_evidence_ok(sentence: str) -> bool:
     return bool(_METRIC_ENUM_RE.search(sentence))
 
 
+# An explicit English statement that something IS an evaluation metric
+# ("evaluated with mIoU", "metrics used are ..."). Kept to English on purpose: a CJK
+# branch such as "指标|评估" fires on any Chinese summary that merely contains 评估, and
+# the bogus maths-paper fact reads "原文使用了评价指标 Recall" -- which would have been
+# waved through as a metric definition.
+_METRIC_DEFINITION_RE = re.compile(
+    r"(?i)(?:metric|measure|indicator)s?\s+(?:is|are|was|were|used|adopted|reported|employed)"
+    r"|(?:evaluat|assess|measur|report)\w*\s+(?:with|using|by)\s+[A-Za-z]"
+    r"|(?:as|an?)\s+(?:evaluation\s+)?(?:metric|measure|indicator)s?\b"
+    # CJK: a metric word must sit directly against an evaluation verb ("mIoU 指标评估",
+    # "指标衡量"), which a bare "评估" summary cannot satisfy.
+    r"|(?:指标|度量)\s*(?:来|用于|评估|衡量|计算)"
+)
+
+# A metric-shaped value: a percentage, or a decimal. A bare short integer is excluded
+# on purpose -- in "误差棒…*p<0.05；**p<0.01", the "0.05" sat next to a metric-ish word
+# and made a statistics note look like a reported score.
+_METRIC_SHAPED_VALUE_RE = re.compile(r"\d+(?:\.\d+)?\s*%|\d+\.\d+")
+# Text allowed between a metric value and its metric name: a connector word
+# ("recall of 0.82", "PSNR 为 33.99") or the Chinese possessive ("0.82 的 recall").
+_METRIC_GLUE = r"[\s:=@（(约的为达至到]*[A-Za-z]{0,5}[\s:=@（(约的为达至到]*"
+# Both directions are anchored at both ends on purpose. Every part of the glue is
+# optional, so an unanchored match succeeds on an EMPTY prefix and accepts any two
+# tokens at all ("0.82 blah recall" would pass). Anchoring forces the whole span
+# between the value and the name to be connector text.
+_METRIC_GLUE_RE = re.compile(r"\A" + _METRIC_GLUE + r"\Z")
+
+
+def _metric_value_near_term(text: str) -> bool:
+    """True when a metric-shaped value sits next to a recognised metric name.
+
+    This is deliberately narrow. Testing the whole sentence for "any number" is
+    useless: `_METRIC_VALUE_RE` matches "为 0.05" inside "误差棒显示…*p<0.05", and a
+    maths paper's "把数值结果记为 L" supplies the "为". Anchoring on the value and
+    requiring a metric name immediately adjacent -- allowing only a short connector
+    ("of", "为", "的") -- is what separates "a recall of 0.82" from
+    "误差棒和显著性 … *p<0.05".
+    """
+    for value in _METRIC_SHAPED_VALUE_RE.finditer(text):
+        for match in _METRIC_TERM_RE.finditer(text):
+            if match.end() <= value.start():
+                span = text[match.end(): value.start()]
+            elif match.start() >= value.end():
+                span = text[value.end(): match.start()]
+            else:
+                continue
+            if _METRIC_GLUE_RE.match(span):
+                return True
+    return False
+
+
+def metric_fact_is_evidenced(fact: "Fact") -> bool:
+    """Whether a `kind="metric"` fact is backed by real metric evidence.
+
+    The LLM extraction layer labels anything metric-flavoured as `kind="metric"`
+    with no gate. Measured on real runs it emitted `误差棒和显著性`, `RANKL浓度`,
+    `统计学显著性`, `ASE 提示注入位置`, and -- reported from a maths paper --
+    "Recall the algebraic definition of the L matrix", where "Recall" is a verb
+    ("回顾", to recall).
+
+    This predicate deliberately does NOT relabel those facts. An LLM's `metric` tag is
+    weak evidence rather than false evidence: an earlier version of this check demoted
+    facts instead, and measurement showed it threw away genuine metrics that simply
+    had no nearby number (`PSNR`, `IoU`, `SPL`, "使用 mIoU 指标评估") while still
+    passing `RANKL浓度` and `统计学显著性`. Losing a true metric is worse than keeping
+    a dubious one, because the fact remains valid evidence for other questions.
+
+    What it is for: gating the `评价指标` answer route, where a bogus metric would
+    otherwise be presented as "the document used this metric" -- the harm actually
+    observed. Such facts stay in the catalogue and can still be cited elsewhere.
+
+    Only `statement` is inspected: it is the extractor's own summary, so a number in it
+    means the model judged a number to be the point. Source quotes are full English
+    sentences carrying numbers incidentally ("Concentration of RANKL ... measured by
+    ELISA" has an "of" and a protein name), which made a concentration measurement read
+    as a reported metric score.
+    """
+    statement = fact.statement
+    if not statement:
+        return False
+    return bool(
+        _PERCENT_EVIDENCE_RE.search(statement)
+        or _METRIC_ENUM_RE.search(statement)
+        or _METRIC_DEFINITION_RE.search(statement)
+        or _metric_value_near_term(statement)
+    )
+
+
+_METRIC_SECTION_RE = re.compile(
+    r"(?i)metric|evaluation|indicator|score|评价|评估|指标|度量"
+)
+
+
+def _metric_evidenced_dict(fact: dict) -> bool:
+    """`metric_fact_is_evidenced` for catalogue dicts, without constructing a Fact.
+
+    `build_question_request` scores hundreds of plain dicts per question, so it must
+    not pay Pydantic validation per candidate, and a hand-built or legacy dict may
+    not satisfy the `Fact` model at all.
+
+    A fact from a section that is *about* metrics ("C.3 Metrics Definition") counts as
+    evidenced on its section context alone: such a section is strong evidence that the
+    document defines metrics there, even when this particular sentence carries no
+    number ("RoleEval 从知识角度客观评估 LLM"). Requiring a nearby number there threw
+    away a genuine metric.
+    """
+    if _METRIC_SECTION_RE.search(str(fact.get("section_title", ""))):
+        return True
+    # Test the STATEMENT only, not the source_quote. The statement is the extractor's
+    # own Chinese summary, so it only mentions a number when the model judged a number
+    # to be the point. Source quotes are full English sentences that contain numbers
+    # incidentally: `Concentration of RANKL in the culture medium measured by ELISA`
+    # carries an "of" and a protein name, which made a concentration measurement look
+    # like a reported metric score.
+    statement = str(fact.get("statement", ""))
+    if not statement:
+        return False
+    return bool(
+        _PERCENT_EVIDENCE_RE.search(statement)
+        or _METRIC_ENUM_RE.search(statement)
+        or _METRIC_DEFINITION_RE.search(statement)
+        or _metric_value_near_term(statement)
+    )
+
+
 def _metric_statement(sentence: str, terms: list[str]) -> str:
     """Chinese restatement of a metric-bearing source sentence. Numbers are kept
     verbatim so a quantitative answer stays auditable against the source."""
@@ -3442,6 +3567,12 @@ def build_question_request(
     has_limitation_or_result = any(
         fact.get("kind") in {"limitation", "result"} for fact in fact_catalog
     )
+    # The 评价指标 route is the one place a bogus metric does real harm: the answer
+    # states "the document used X as a metric", citing the fact as proof. The LLM's
+    # `metric` tag alone is not enough for that (see `metric_fact_is_evidenced` for
+    # the measured cases). Such facts stay in the catalogue and remain citable for
+    # other questions -- only their standing as *the document's metric* is withdrawn.
+    metric_route = any(term in question for term in ("评价指标", "指标"))
 
     section_title_routes = [
         (("数据集", "材料"), ("dataset", "data set", "material", "数据集", "材料")),
@@ -3482,7 +3613,9 @@ def build_question_request(
         if any(term in question for term in ("数据集", "材料")):
             return 32 if kind == "dataset" else 0
         if any(term in question for term in ("评价指标", "指标")):
-            return {"metric": 32, "definition": 12, "method": 6}.get(kind, 0)
+            if kind == "metric":
+                return 32
+            return {"definition": 12, "method": 6}.get(kind, 0)
         if any(term in question for term in ("比较了", "模型")):
             return {"classification": 32, "method": 12, "relation": 10}.get(kind, 0)
         if any(term in question for term in ("局限", "不足")):
@@ -3505,6 +3638,13 @@ def build_question_request(
         text = f"{fact.get('concept', '')} {fact.get('statement', '')}".lower()
         title = re.sub(r"[^a-z0-9\u3400-\u9fff]+", " ", str(fact.get("section_title", "")).lower())
         value = kind_relevance(fact)
+        if metric_route and fact.get("kind") == "metric" and not _metric_evidenced_dict(fact):
+            # Withdraw this fact's standing as *the document's evaluation metric*
+            # when it carries no metric evidence, while leaving it in the catalogue
+            # (it stays citable for other questions). A flat zero, as the future-work
+            # route uses, would empty the catalog on a document whose metric facts are
+            # all definitional, so sink it below real evidence instead.
+            value -= 40
         if fact.get("kind") == "metric":
             # A row of a result/correlation table. Statements no longer carry a
             # "Table N:" prefix (the caption moved to a single per-table header
@@ -3985,7 +4125,8 @@ class LongDocumentPipeline:
         cached = self.cache.get(key)
         if cached:
             result = _apply_grounding(ChunkExtraction.model_validate(cached), chunk.text, chunk.page_texts)
-            return _assign_fact_ids(result, section.id)
+            result = _assign_fact_ids(result, section.id)
+            return result
         memory = self.memory.retrieve(chunk.text, document_key=getattr(self, "document_key", ""))
         system = """你是严格的长文事实抽取器。只抽取原文明确支持的信息，并输出 JSON：
 {"summary":"本块摘要","facts":[{"concept":"概念","statement":"事实","kind":"definition|formula|method|result|limitation|advantage|disadvantage|example|relation|classification|dataset|metric","source_quote":"原文逐字引用","page":1,"confidence":0.95}],"new_concepts":["概念"]}

@@ -84,6 +84,8 @@ from p2g_v2 import (  # noqa: E402
     _claim_tokens,
     _numeric_forms,
     audit_overview_numerics,
+    metric_fact_is_evidenced,
+    _metric_evidenced_dict,
 )
 
 
@@ -272,6 +274,79 @@ class MetricFactExtractionTests(unittest.TestCase):
         )
 
         self.assertIn(metric_evidence[0]["fact_id"], allowed)
+
+
+class MetricEvidenceTests(unittest.TestCase):
+    """The LLM tags anything metric-flavoured as `kind="metric"` with no gate.
+
+    Reported from a real maths-paper run: the fact `fact-36e4049ec6d76c10` had
+    source_quote "Recall the algebraic definition of the L matrix" -- where "Recall"
+    means 回顾 -- yet was labelled `kind="metric"` and cited for "使用了哪些评价指标？".
+    The deterministic prose extractor does NOT fire there (no number, no percentage),
+    so the bogus tag came from the LLM layer.
+    """
+
+    def test_a_verb_recall_is_not_an_evidenced_metric(self):
+        fact = Fact(
+            fact_id="fact-36e4049ec6d76c10", concept="Recall",
+            statement="原文使用了评价指标 Recall，并把数值结果记为 L。",
+            kind="metric", source_quote="Recall the algebraic definition of the L matrix",
+            page=45, confidence=0.9, grounded=True,
+        )
+
+        self.assertFalse(metric_fact_is_evidenced(fact))
+
+    def test_statistics_notes_are_not_evidenced_metrics(self):
+        for concept, statement, quote in (
+            ("误差棒和显著性", "误差棒显示来自n=3独立实验的平均值±标准差。",
+             "Error bars shows mean ± SD derived from n = 3 independent experiments"),
+            ("统计学显著性", "误差棒表示来自 n=3 次独立实验的平均值 ± SD。",
+             "Error bars indicate mean ± SD were derived from n = 3 independent"),
+            ("RANKL浓度", "ELISA检测培养液中RANKL浓度。",
+             "Concentration of RANKL in the culture medium measured by ELISA"),
+        ):
+            fact = Fact(fact_id="f", concept=concept, statement=statement, kind="metric",
+                        source_quote=quote, page=1, confidence=0.9, grounded=True)
+            self.assertFalse(metric_fact_is_evidenced(fact), concept)
+
+    def test_a_reported_metric_score_is_evidenced(self):
+        fact = Fact(
+            fact_id="f", concept="Recall",
+            statement="模型在测试集上取得 0.82 的 recall。",
+            kind="metric", source_quote="achieves a recall of 0.82 on the test set",
+            page=1, confidence=0.9, grounded=True,
+        )
+
+        self.assertTrue(metric_fact_is_evidenced(fact))
+
+    def test_a_metrics_section_supplies_the_evidence(self):
+        # "RoleEval从知识角度客观评估LLM" is a genuine metric with no nearby number.
+        # Its section is what makes it evidenced; requiring a number threw it away.
+        evidenced = {"fact_id": "f", "kind": "metric", "confidence": 0.95,
+                     "statement": "RoleEval从知识角度客观评估LLM。",
+                     "section_title": "C.3 Metrics Definition"}
+        unevidenced = {**evidenced, "section_title": "3.1 Model Architecture"}
+
+        self.assertTrue(_metric_evidenced_dict(evidenced))
+        self.assertFalse(_metric_evidenced_dict(unevidenced))
+
+    def test_bogus_metric_leaves_the_metric_route_but_stays_citable(self):
+        facts = [
+            {"fact_id": "fact-36e4049ec6d76c10", "concept": "Recall",
+             "statement": "原文使用了评价指标 Recall，并把数值结果记为 L。",
+             "kind": "metric", "section_title": "4.2 The L matrix",
+             "source_quote": "Recall the algebraic definition of the L matrix",
+             "confidence": 0.9},
+            {"fact_id": "fact-real", "concept": "mIoU",
+             "statement": "使用平均交并比（mIoU）指标评估语义分割。",
+             "kind": "metric", "section_title": "4 Experiments",
+             "source_quote": "we evaluate with mIoU", "confidence": 0.95},
+        ]
+
+        _, allowed = build_question_request("使用了哪些评价指标？", facts, [], max_tokens=600)
+
+        self.assertNotIn("fact-36e4049ec6d76c10", allowed)
+        self.assertIn("fact-real", allowed)
 
 
 class HeadingTreeTests(unittest.TestCase):
