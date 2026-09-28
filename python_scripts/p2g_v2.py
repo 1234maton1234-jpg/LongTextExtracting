@@ -3744,18 +3744,24 @@ def build_question_request(
         fact_id = fact.get("fact_id")
         if not fact_id or score(fact)[0] <= 0:
             continue
-        # Only model-facing fields go into the catalogue. `section_title` is used for
-        # RANKING above (`section_relevance`, +4 per matching section term) but has no
-        # job in the payload: the model cites `fact_id` and quotes `statement`, and
-        # provenance/confidence/pages are recovered from `fact_index` afterwards, so
-        # the catalogue is not the source of truth for them. Measured on a 48-page
-        # paper, removing it cuts the per-fact cost from 105 to 82 tokens (-22%),
-        # which fits ~4 more facts into the same budget.
+        # `section_title` is used for RANKING above (`section_relevance`, +4 per
+        # matching section term), but it is ALSO kept in the payload. The token cost
+        # is real (105 vs 82 tokens per entry, ~4-6 fewer facts per question without
+        # it), and removing it was tried. It was put back because a 14-pair A/B on the
+        # same facts measured the quality cost as likely real:
+        #   total sentences removed from answers: with 44/294 (0.150) vs without
+        #   69/302 (0.229) -- 1.57x more ungrounded sentences without the section name
+        #   paired difference (off-on) = +0.079, t = +2.03, 95% CI [-0.005, +0.162]
+        # The interval still touches zero, so this is a judgement rather than a proven
+        # effect: the point estimate is the wrong sign for a saving we would ship, and
+        # the project's constraint is to hold quality while trimming tokens. Cheaper
+        # savings that do not remove context the model reasons over are preferred.
         compact_fact = {
             "fact_id": fact_id,
             "concept": _prefix_for_budget(str(fact.get("concept", "")), 40),
             "statement": _prefix_for_budget(str(fact.get("statement", "")), 180),
             "kind": fact.get("kind", "relation"),
+            "section_title": _prefix_for_budget(str(fact.get("section_title", "")), 40),
         }
         candidate = {**payload, "fact_catalog": [*payload["fact_catalog"], compact_fact]}
         if estimate_tokens(json.dumps(candidate, ensure_ascii=False)) > max_tokens:
@@ -4029,7 +4035,7 @@ class LongDocumentPipeline:
                         else:
                             recovered, seed = await self._regenerate_truncated(
                                 stage, model, system, user, response_model,
-                                max_output_tokens,
+                                max_output_tokens, partial=seed_text,
                             )
                         if recovered is not None:
                             return recovered
@@ -4138,14 +4144,43 @@ class LongDocumentPipeline:
         user: str,
         response_model: type[BaseModel] | None,
         max_output_tokens: int,
+        partial: str | None = None,
     ) -> tuple[dict | None, object]:
-        """Re-issue the full JSON request with thinking off so the whole output
-        budget goes to content. Returns (payload, response)."""
+        """Re-issue the JSON request with thinking off so the whole output budget goes
+        to content. Returns (payload, response).
+
+        When `partial` carries what the previous attempt already produced, it is sent
+        as the assistant turn and the model is asked to finish it, rather than being
+        handed the same question with no memory of its own output. Two measured
+        reasons: the recovery loop used to DISCARD the first continuation's text and
+        start over, and `global_answer_regen` was spending 15.9:1 input-to-output
+        (50,319 input tokens to produce 3,171) because each retry re-sent the whole
+        ~1,900-token catalogue to repair a reply it had already written.
+        """
+        if partial:
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+                {"role": "assistant", "content": partial},
+                {
+                    "role": "user",
+                    "content": (
+                        "The previous assistant response was truncated mid-JSON. "
+                        "Finish it so the combined messages form a single valid JSON "
+                        "object. Only output the remaining JSON."
+                    ),
+                },
+            ]
+        else:
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ]
         async with self.semaphore:
             started = time.perf_counter()
             regen_resp = await self.client.chat.completions.create(
                 model=model,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                messages=messages,
                 response_format={"type": "json_object"},
                 temperature=0.0,
                 max_tokens=max(2048, max_output_tokens),
@@ -4156,7 +4191,13 @@ class LongDocumentPipeline:
         self._log_model_response(
             stage + "_regen", model, 0, regen_resp, getattr(regen_resp, "choices", [None])[0], None
         )
-        return self._payload_from_response(regen_resp, response_model), regen_resp
+        payload = self._payload_from_response(regen_resp, response_model)
+        if payload is None and partial:
+            # The model may have returned only the tail; try it joined to the seed.
+            tail = self._message_content(regen_resp)
+            if tail:
+                payload = self._parse_payload(partial + tail, response_model)
+        return payload, regen_resp
 
     def _parse_payload(self, content: object, response_model: type[BaseModel] | None) -> dict | None:
         """Return a validated payload parsed from content, or None if unusable."""

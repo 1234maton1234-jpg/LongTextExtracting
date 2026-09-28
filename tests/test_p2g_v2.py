@@ -3536,7 +3536,10 @@ class RequestRetryTests(unittest.IsolatedAsyncioTestCase):
         await self._cleanup_usage(pipeline)
 
     async def test_continuation_also_truncated_falls_back_to_regenerate(self):
-        # continuation also truncates -> next recovery attempt re-issues from scratch.
+        # continuation also truncates -> next recovery attempt retries. It must carry
+        # the partial output forward rather than restarting: the previous behaviour
+        # discarded the first continuation's text and re-sent the whole prompt, which
+        # is what made `global_answer_regen` cost 15.9:1 input-to-output.
         valid = {
             "summary": "摘要",
             "facts": [],
@@ -3556,12 +3559,15 @@ class RequestRetryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["summary"], "摘要")
         self.assertEqual(completions.calls, 3)
-        # call[0] = original (low), call[1] = continuation (none, seeded), call[2] = regen (none, no seed)
+        # call[0] = original (low), call[1] = continuation (none, seeded),
+        # call[2] = regen (none, seeded with the partial output)
         self.assertEqual(completions.kwargs[0]["reasoning_effort"], "low")
         self.assertEqual(completions.kwargs[1]["reasoning_effort"], "none")
         self.assertEqual(len(completions.kwargs[1]["messages"]), 4)
         self.assertEqual(completions.kwargs[2]["reasoning_effort"], "none")
-        self.assertEqual(len(completions.kwargs[2]["messages"]), 2)
+        self.assertEqual(len(completions.kwargs[2]["messages"]), 4)
+        # The seed must be the partial JSON the model already produced.
+        self.assertIn("部分2", completions.kwargs[2]["messages"][2]["content"])
         await self._cleanup_usage(pipeline)
 
     async def _make_extract_pipeline(self, scripted_responses):
