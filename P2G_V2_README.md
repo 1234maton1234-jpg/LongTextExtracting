@@ -175,7 +175,13 @@ LLM 抽取层会把**任何指标味道的词**标成 `kind="metric"`，没有�
 # 对已存的运行结果重复「章节归纳 → 分组归纳 → 概述 → 10 问」N 次
 .\longtext\Scripts\python.exe python_scripts\multiround_eval.py `
   outputs\_e_Attention_1706.03762.json outputs\_e_SegEarth-OV_CVPR2025.json --rounds 3
+
+# 连抽取一起重跑（验证抽取层/截断续写改动时需要；PDF 从 inputs/ 按名字匹配）
+.\longtext\Scripts\python.exe python_scripts\multiround_eval.py `
+  outputs\_e_Attention_1706.03762.json --rounds 3 --full
 ```
+
+`--full` 会重新解析 PDF 并跑抽取，因此**续写/恢复链路也被覆盖**；不加 `--full` 则复用已抽好的事实，只重跑归纳与问答（更省、且把抽取噪声固定住）。
 
 它复用已抽取的事实，只重跑非确定性的归纳/问答阶段——每轮变化的只有模型采样本身，且省下块抽取的调用。输出包括：逐轮指标、**均值±标准差与范围**、**每题答案的跨轮稳定性**、以及**数字-主体错配筛查**（供人工阅读的候选清单，不是判定）。逐轮明细写入 `outputs/eval/`，并保留 `per_answer` 的逐题句数，以便把"无据句变多"与"答案变短"区分开——后者会在这个比值上制造假变化。
 

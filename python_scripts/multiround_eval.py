@@ -46,6 +46,7 @@ from p2g_v2 import (  # noqa: E402
     GLOBAL_QUESTIONS,
     LongDocumentPipeline,
     build_section_evidence,
+    preprocess_pdf,
     run_evidence_metrics,
     shard_section_evidence,
     _build_fact_index,
@@ -121,6 +122,36 @@ def screen_mispairings(synthesis: dict, fact_index: dict[str, dict]) -> list[dic
     return flagged
 
 
+def _locate_pdf(run_json: Path) -> Path | None:
+    """Find the source PDF for a run output, for `--full`.
+
+    Matches on the run name against `inputs/`, so `_e_Attention_1706.03762.json`
+    finds `inputs/Attention_1706.03762.pdf`. An explicit `--pdf` wins.
+    """
+    override = _PDF_OVERRIDE.get(run_json)
+    if override is not None:
+        return override if override.exists() else None
+    stem = run_json.stem.lstrip("_")
+    for prefix in ("e_", "t_", "base_", "opt_"):
+        if stem.startswith(prefix):
+            stem = stem[len(prefix):]
+    inputs = PROJECT_ROOT / "inputs"
+    if not inputs.is_dir():
+        return None
+    candidate = inputs / f"{stem}.pdf"
+    if candidate.exists():
+        return candidate
+    # Fall back to a looser match on the leading identifier.
+    head = stem.split("_")[0]
+    for pdf in sorted(inputs.glob("*.pdf")):
+        if head and head in pdf.stem:
+            return pdf
+    return None
+
+
+_PDF_OVERRIDE: dict[Path, Path] = {}
+
+
 def _summarise(values: list[float]) -> dict:
     if not values:
         return {"mean": None, "stdev": None, "min": None, "max": None}
@@ -140,11 +171,21 @@ async def run_rounds(
     flash_model: str,
     pro_model: str,
     out_dir: Path,
+    full_pipeline: bool = False,
 ) -> dict:
     data = json.loads(run_json.read_text(encoding="utf-8"))
     sections = data.get("sections") or []
     if not sections:
         raise ValueError(f"{run_json.name} has no sections")
+    if full_pipeline:
+        # Re-run extraction too, from the original PDF when it is available next to
+        # the run output. Needed to verify changes that live in the extraction or
+        # recovery layer, which the synthesis-only replay never exercises.
+        pdf = _locate_pdf(run_json)
+        if pdf is None:
+            raise ValueError(
+                f"--full needs the source PDF for {run_json.name}; pass --pdf"
+            )
     label = run_json.stem
     api_key = os.environ.get("DEEPSEEK_API_KEY", "")
     if not api_key:
@@ -165,6 +206,14 @@ async def run_rounds(
         )
         pipeline.document_title = (data.get("document_synthesis") or {}).get("title")
         try:
+            if full_pipeline:
+                # Extraction included, so the truncation/recovery path is exercised.
+                _, pdf_sections = preprocess_pdf(pdf, False)
+                sections = []
+                for section in pdf_sections:
+                    sections.append(
+                        await pipeline.process_section(section, 3200, 180)
+                    )
             synthesis = await pipeline.synthesize_document(
                 sections, max_tokens=reduce_max_tokens
             )
@@ -286,19 +335,31 @@ def main() -> None:
     parser.add_argument("--flash-model", default="deepseek-v4-flash")
     parser.add_argument("--pro-model", default="deepseek-v4-pro")
     parser.add_argument("--out-dir", default="outputs/eval")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Re-run extraction from the source PDF as well, so changes in the "
+             "extraction or truncation-recovery layer are exercised. Needs the PDF "
+             "in inputs/ (matched by name) or an explicit --pdf.",
+    )
+    parser.add_argument("--pdf", action="append", default=[],
+                        help="PDF for --full, in the same order as the run files.")
     args = parser.parse_args()
 
     _load_env()
     out_dir = PROJECT_ROOT / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = [Path(p) if Path(p).is_absolute() else PROJECT_ROOT / p for p in args.runs]
+    explicit = [Path(p) if Path(p).is_absolute() else PROJECT_ROOT / p for p in args.pdf]
 
     results = []
-    for path in paths:
+    for index, path in enumerate(paths):
         print(f"\n########## {path.name} ##########")
+        if args.full and index < len(explicit):
+            _PDF_OVERRIDE[path] = explicit[index]
         results.append(asyncio.run(run_rounds(
             path, args.rounds, args.concurrency, args.reduce_max_tokens,
-            args.flash_model, args.pro_model, out_dir,
+            args.flash_model, args.pro_model, out_dir, args.full,
         )))
     report(results, args.rounds)
     print(f"\n逐轮明细已写入 {out_dir}/")
