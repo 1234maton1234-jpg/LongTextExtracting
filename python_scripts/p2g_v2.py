@@ -3815,6 +3815,7 @@ class LongDocumentPipeline:
         document_max_output_tokens: int = 3000,
         group_batch_tokens: int = 9600,
         lean_group_payload: bool = True,
+        section_concurrency: int = 4,
         document_title: str | None = None,
         document_key: str = "",
     ):
@@ -3832,6 +3833,10 @@ class LongDocumentPipeline:
         self.group_batch_tokens = max(1000, group_batch_tokens)
         # Send only the fields the group stage reads (see `_lean_group_items`).
         self.lean_group_payload = lean_group_payload
+        # How many SECTIONS may be processed at once. Distinct from `concurrency`,
+        # which caps total in-flight API calls. 1 reproduces the previous serial
+        # behaviour.
+        self.section_concurrency = max(1, section_concurrency)
         self.client = AsyncOpenAI(
             api_key=api_key,
             base_url="https://api.deepseek.com",
@@ -4890,6 +4895,7 @@ async def _run(args: argparse.Namespace) -> None:
         content_retry_base_seconds=args.retry_base_seconds,
         group_batch_tokens=args.group_batch_tokens,
         lean_group_payload=not args.full_group_payload,
+        section_concurrency=args.section_concurrency,
         extract_max_output_tokens=args.extract_max_output_tokens,
         reduce_max_output_tokens=args.reduce_max_output_tokens,
         document_max_output_tokens=args.document_max_output_tokens,
@@ -4897,23 +4903,70 @@ async def _run(args: argparse.Namespace) -> None:
         document_key=args.document_key or _document_key(args.pdf),
     )
     try:
-        results = []
-        for index, section in enumerate(sections, 1):
-            print(f"[{index}/{len(sections)}] {section.title}")
-            results.append(await pipeline.process_section(section, args.max_tokens, args.overlap_tokens))
+        # Sections are processed concurrently. Each section is internally serial
+        # (chunk extraction -> reduce -> merge), and every model call already takes
+        # the shared API semaphore, so total in-flight requests stay bounded by
+        # `--concurrency` while several sections can be in flight at once. Measured
+        # on a 48-page paper, serial section processing made chunk_extract (47.5%)
+        # plus section_reduce (19.8%) of all stage time add up sequentially, which
+        # dominated wall-clock and left the API mostly idle between calls.
+        section_limit = max(1, getattr(pipeline, "section_concurrency", 1))
+        section_gate = asyncio.Semaphore(section_limit)
+        results: list[dict | None] = [None] * len(sections)
+        finished = 0
+        progress_lock = asyncio.Lock()
+
+        async def run_section(index: int, section: HeadingNode) -> None:
+            nonlocal finished
+            async with section_gate:
+                results[index] = await pipeline.process_section(
+                    section, args.max_tokens, args.overlap_tokens
+                )
+            async with progress_lock:
+                finished += 1
+                print(f"[{finished}/{len(sections)}] {section.title}", flush=True)
+                # Persist progress; any completed section survives an interruption.
+                output.write_text(
+                    json.dumps(
+                        {
+                            "sections": [item for item in results if item is not None],
+                            "document_synthesis": None,
+                            "stats": pipeline.stats(),
+                            "evidence_metrics": run_evidence_metrics(
+                                [item for item in results if item is not None], None
+                            ),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+
+        try:
+            await asyncio.gather(
+                *(run_section(index, section) for index, section in enumerate(sections))
+            )
+        except BaseException:
+            # A cancelled or failed companion must not discard completed sections:
+            # the output file already holds them, but the caller should still learn
+            # the run failed rather than receiving a silently partial result.
             output.write_text(
                 json.dumps(
                     {
-                        "sections": results,
+                        "sections": [item for item in results if item is not None],
                         "document_synthesis": None,
                         "stats": pipeline.stats(),
-                        "evidence_metrics": run_evidence_metrics(results, None),
+                        "evidence_metrics": run_evidence_metrics(
+                            [item for item in results if item is not None], None
+                        ),
                     },
                     ensure_ascii=False,
                     indent=2,
                 ),
                 encoding="utf-8",
             )
+            raise
+        results = [item for item in results if item is not None]
         document_synthesis = None
         if len(results) > 1 and not args.skip_document_reduce:
             print(f"[Global] reducing {len(results)} sections")
@@ -4982,6 +5035,14 @@ def main() -> None:
     parser.add_argument("--flash-model", default="deepseek-v4-flash")
     parser.add_argument("--pro-model", default="deepseek-v4-pro")
     parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument(
+        "--section-concurrency",
+        type=int,
+        default=4,
+        help="How many sections to process at once. Each section is internally "
+             "serial; total in-flight API calls stay bounded by --concurrency. "
+             "Use 1 to reproduce serial section processing.",
+    )
     parser.add_argument("--content-retries", type=int, default=3)
     parser.add_argument("--retry-base-seconds", type=float, default=1.0)
     parser.add_argument("--extract-max-output-tokens", type=int, default=4096)
