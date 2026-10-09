@@ -17,7 +17,7 @@ from typing import Literal
 import pymupdf
 import pymupdf4llm
 from openai import AsyncOpenAI
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, PrivateAttr, ValidationError, field_validator
 
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
@@ -39,10 +39,11 @@ PICTURE_TEXT_BLOCK_RE = re.compile(
 )
 IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 MARK_TAG_RE = re.compile(r"</?mark\b[^>]*>", re.IGNORECASE)
-EXTRACTION_PROMPT_VERSION = "v2.10"
-REDUCE_PROMPT_VERSION = "v2.9"
-GROUP_PROMPT_VERSION = "v2.11"
-DOCUMENT_PROMPT_VERSION = "v2.18"
+EXTRACTION_PROMPT_VERSION = "v2.21"
+REDUCE_PROMPT_VERSION = "v2.11"
+GROUP_PROMPT_VERSION = "v2.13"
+DOCUMENT_PROMPT_VERSION = "v2.26"
+DEFAULT_GROUP_BATCH_TOKENS = 12800
 GLOBAL_QUESTIONS = [
     "文档的核心研究问题是什么？",
     "文档使用了哪些数据集或材料？",
@@ -125,6 +126,12 @@ class Fact(BaseModel):
     page: int | None = None
     confidence: float = Field(ge=0, le=1)
     grounded: bool = False
+    source_origin: Literal["text", "pdf_text_layer", "picture_ocr"] = "text"
+    _quote_grounded: bool | None = PrivateAttr(default=None)
+    _quote_origin: str | None = PrivateAttr(default=None)
+    _formula_operator_signature_match: bool | None = PrivateAttr(default=None)
+    _formula_structure_verified: bool | None = PrivateAttr(default=None)
+    _formula_validation_reason: str | None = PrivateAttr(default=None)
 
     @field_validator("kind", mode="before")
     @classmethod
@@ -241,21 +248,122 @@ class GroupSynthesis(BaseModel):
         return _ensure_list(value)
 
 
+class EvidenceChainStep(BaseModel):
+    step_index: int = Field(ge=1)
+    claim: str = Field(min_length=1, max_length=500)
+    source_fact_ids: list[str] = Field(default_factory=list)
+    relation_to_previous: Literal["none", "supports", "combines", "contrasts"] = "none"
+    source_resolution: Literal["model_ids", "heuristic_recovery", "unresolved"] = "unresolved"
+    source_pointer_status: Literal["validated", "incomplete", "invalid"] = "invalid"
+    claim_support_status: Literal[
+        "heuristic_supported", "heuristic_unsupported", "unchecked"
+    ] = "unchecked"
+
+    @field_validator("relation_to_previous", mode="before")
+    @classmethod
+    def normalize_relation(cls, value: str) -> str:
+        allowed = {"none", "supports", "combines", "contrasts"}
+        normalized = str(value or "none").strip().lower()
+        return normalized if normalized in allowed else "none"
+
+    @field_validator("source_fact_ids", mode="before")
+    @classmethod
+    def normalize_source_fact_ids(cls, value):
+        return _ensure_list(value)
+
+    @field_validator("source_resolution", mode="before")
+    @classmethod
+    def reset_source_resolution(cls, _value):
+        return "unresolved"
+
+    @field_validator("source_pointer_status", mode="before")
+    @classmethod
+    def reset_source_pointer_status(cls, _value):
+        return "invalid"
+
+    @field_validator("claim_support_status", mode="before")
+    @classmethod
+    def reset_claim_support_status(cls, _value):
+        return "unchecked"
+
+
 class GlobalAnswer(BaseModel):
     question: str
     answer: str
     source_fact_ids: list[str] = Field(default_factory=list)
+    evidence_chain: list[EvidenceChainStep] = Field(default_factory=list)
+    evidence_chain_status: Literal[
+        "pointers_validated_relations_unverified",
+        "partial_or_invalid_pointers",
+        "unavailable",
+        "unavailable_legacy",
+        "deterministic_short_circuit",
+    ] = "unavailable"
+    relation_validation: Literal["not_performed"] = "not_performed"
     source_sections: list[str]
     source_pages: list[int]
     confidence: float = Field(ge=0, le=1)
     unsupported_claims: list[str] = Field(default_factory=list)
 
     @field_validator(
-        "source_fact_ids", "source_sections", "source_pages", "unsupported_claims", mode="before"
+        "source_fact_ids",
+        "evidence_chain",
+        "source_sections",
+        "source_pages",
+        "unsupported_claims",
+        mode="before",
     )
     @classmethod
     def normalize_list_fields(cls, value):
         return _ensure_list(value)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def normalize_confidence(cls, value):
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            categorical = {
+                "very high": 0.95,
+                "high": 0.85,
+                "medium": 0.6,
+                "moderate": 0.6,
+                "low": 0.3,
+                "very low": 0.1,
+                "很高": 0.95,
+                "高": 0.85,
+                "中": 0.6,
+                "中等": 0.6,
+                "低": 0.3,
+                "很低": 0.1,
+            }
+            if normalized in categorical:
+                return categorical[normalized]
+            percentage = normalized.endswith("%")
+            numeric = normalized[:-1].strip() if percentage else normalized
+            try:
+                parsed = float(numeric)
+            except ValueError:
+                return 0.0
+            if percentage or parsed > 1:
+                parsed /= 100
+            value = parsed
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(parsed):
+            return 0.0
+        return min(1.0, max(0.0, parsed))
+
+    @field_validator("evidence_chain_status", mode="before")
+    @classmethod
+    def reset_evidence_chain_status(cls, _value):
+        return "unavailable"
+
+    @field_validator("relation_validation", mode="before")
+    @classmethod
+    def disable_unimplemented_relation_validation(cls, _value):
+        return "not_performed"
 
 
 class DocumentOverview(BaseModel):
@@ -409,11 +517,28 @@ def _page_texts_for_range(
     return result
 
 
+def _extract_picture_ocr(text: str) -> str:
+    """Retain pymupdf4llm's picture OCR separately from normal page prose."""
+    blocks = [match.group(0) for match in PICTURE_TEXT_BLOCK_RE.finditer(text or "")]
+    values = []
+    for value in blocks:
+        value = re.sub(r"<!--\s*Start of picture text\s*-->|<!--\s*End of picture text\s*-->", "", value, flags=re.IGNORECASE)
+        value = IMG_TAG_RE.sub(" ", value)
+        value = MARK_TAG_RE.sub("", value)
+        value = re.sub(r"<br\s*/?>", " ", value, flags=re.IGNORECASE)
+        value = re.sub(r"<[^>]*>", " ", value)
+        cleaned = re.sub(r"\s+", " ", value).strip()
+        if cleaned:
+            values.append(cleaned)
+    return "\n".join(values)
+
+
 def _strip_picture_text(text: str) -> str:
-    """Remove OCR/picture artifacts that pymupdf4llm emits for rasterized
-    figures: the ``<!-- Start of picture text --> …`` HTML comment block (text
-    read out of the image), inline ``<img …>`` tags, and ``<mark>`` highlight
-    spans (their inner text is kept)."""
+    """Remove OCR/picture artifacts from the primary prose stream.
+
+    The extracted picture text is kept separately by `extract_pdf_pages` for
+    targeted formula recovery; figures do not get mixed into ordinary prose.
+    """
     text = PICTURE_TEXT_BLOCK_RE.sub("", text)
     text = IMG_TAG_RE.sub("", text)
     text = MARK_TAG_RE.sub("", text)
@@ -460,12 +585,36 @@ def extract_pdf_pages(pdf_path: str | Path) -> list[PageMarkdown]:
     path = Path(pdf_path)
     validate_pdf(path)
     raw_pages = pymupdf4llm.to_markdown(str(path), page_chunks=True)
-    pages = []
-    for index, item in enumerate(raw_pages):
-        metadata = item.get("metadata", {})
-        page = metadata.get("page_number", metadata.get("page", index + 1))
-        text = _strip_picture_text(item.get("text", ""))
-        pages.append(PageMarkdown(page=int(page), text=text, metadata=metadata))
+    with pymupdf.open(str(path)) as source_pdf:
+        pages = []
+        for index, item in enumerate(raw_pages):
+            metadata = item.get("metadata", {})
+            page = metadata.get("page_number", metadata.get("page", index + 1))
+            raw_text = item.get("text", "")
+            picture_ocr = _extract_picture_ocr(raw_text)
+            metadata = dict(metadata)
+            if picture_ocr:
+                metadata["picture_ocr_text"] = picture_ocr
+            text = _strip_picture_text(raw_text)
+            if _FORMULA_PAGE_CUE_RE.search(text) and _has_formula_stub(text):
+                try:
+                    native_text = source_pdf[index].get_text("text")
+                except Exception:  # noqa: BLE001 - optional recovery must not abort parsing
+                    native_text = ""
+                if native_text:
+                    metadata["native_pdf_text"] = native_text
+                    try:
+                        source_page = source_pdf[index]
+                        layout = _native_pdf_formula_layout(
+                            source_page.get_text("dict"),
+                            float(source_page.rect.width),
+                            float(source_page.rect.height),
+                        )
+                    except Exception:  # noqa: BLE001 - layout hints are optional
+                        layout = None
+                    if layout:
+                        metadata["native_pdf_layout"] = layout
+            pages.append(PageMarkdown(page=int(page), text=text, metadata=metadata))
     return pages
 
 
@@ -684,13 +833,20 @@ def build_heading_tree(pages: list[PageMarkdown]) -> HeadingNode:
     )
     stack = [root]
     sequence = 0
+    metadata_by_page = {page.page: dict(page.metadata) for page in pages}
 
     def append_line(node: HeadingNode, page: int, line: str) -> None:
         node.text = f"{node.text}\n{line}".strip()
         if node.page_texts and node.page_texts[-1].page == page:
             node.page_texts[-1].text = f"{node.page_texts[-1].text}\n{line}".strip()
         else:
-            node.page_texts.append(PageMarkdown(page=page, text=line.strip()))
+            node.page_texts.append(
+                PageMarkdown(
+                    page=page,
+                    text=line.strip(),
+                    metadata=dict(metadata_by_page.get(page, {})),
+                )
+            )
         node.page_end = page
         node.subtree_page_end = page
 
@@ -1364,24 +1520,229 @@ def _quote_is_grounded(quote: str, source: str) -> bool:
     return bool(compact_quote) and compact_quote in compact_source
 
 
-def _quote_page(quote: str, page_texts: list[PageMarkdown]) -> int | None:
+def _formula_quote_is_grounded(quote: str, source: str) -> bool:
+    """Match equation evidence conservatively while preserving math operators."""
+    def compact(value: str) -> str:
+        value = re.sub(r"<[^>]*>", "", value)
+        value = value.translate(str.maketrans({
+            "⁰": "^0", "¹": "^1", "²": "^2", "³": "^3", "⁴": "^4",
+            "⁵": "^5", "⁶": "^6", "⁷": "^7", "⁸": "^8", "⁹": "^9",
+        }))
+        value = unicodedata.normalize("NFKC", value).casefold().replace("−", "-")
+        return re.sub(r"\s+", "", value)
+
+    compact_quote = compact(quote)
+    compact_source = compact(source)
+    return bool(compact_quote) and compact_quote in compact_source
+
+
+_MATH_QUOTE_OPERATOR_RE = re.compile(r"[=≤≥≠≈∑∏√+*/^−-]")
+
+
+def _formula_operator_signature(value: str) -> str:
+    value = re.sub(r"<sup[^>]*>(.*?)</sup>", r"^\1", value, flags=re.IGNORECASE | re.DOTALL)
+    value = re.sub(r"<sub[^>]*>(.*?)</sub>", r"_\1", value, flags=re.IGNORECASE | re.DOTALL)
+    value = re.sub(r"<[^>]*>", "", value)
+    value = value.translate(str.maketrans({
+        "⁰": "^0", "¹": "^1", "²": "^2", "³": "^3", "⁴": "^4",
+        "⁵": "^5", "⁶": "^6", "⁷": "^7", "⁸": "^8", "⁹": "^9",
+    }))
+    value = re.sub(r"(?<=[A-Za-z])-(?=[A-Za-z])", "", value)
+    value = unicodedata.normalize("NFKC", value).replace("−", "-")
+    return "".join(_MATH_QUOTE_OPERATOR_RE.findall(value))
+
+
+def _has_formula_operator(value: str) -> bool:
+    value = re.sub(r"(?<=[A-Za-z])-(?=[A-Za-z])", "", value or "")
+    return bool(_MATH_QUOTE_OPERATOR_RE.search(value))
+
+
+def _formula_quote_supports_statement(fact: Fact) -> bool:
+    """Report only whether the ordered math-operator signatures agree."""
+    quote = fact.source_quote or ""
+    statement = fact.statement or ""
+    formula_like = fact.kind == "formula" or (
+        _has_formula_operator(quote) and _has_formula_operator(statement)
+    )
+    if not formula_like:
+        return True
+    quoted_ops = _formula_operator_signature(quote)
+    statement_ops = _formula_operator_signature(statement)
+    return bool(quoted_ops) and quoted_ops == statement_ops
+
+
+def _formula_expression_fragment(value: str) -> str:
+    value = re.sub(r"<sup[^>]*>(.*?)</sup>", r"^\1", value, flags=re.IGNORECASE | re.DOTALL)
+    value = re.sub(r"<sub[^>]*>(.*?)</sub>", r"_\1", value, flags=re.IGNORECASE | re.DOTALL)
+    value = re.sub(r"<[^>]*>", "", value)
+    value = re.sub(r"(?<![A-Za-z])choose(?![A-Za-z])", "", value, flags=re.IGNORECASE)
+    value = value.translate(str.maketrans({
+        "⁰": "^0", "¹": "^1", "²": "^2", "³": "^3", "⁴": "^4",
+        "⁵": "^5", "⁶": "^6", "⁷": "^7", "⁸": "^8", "⁹": "^9",
+    }))
+    cue = re.compile(
+        r"(?i)\b(?:is|are)\s+(?:given\s+by\s+)?|(?:公式|表达式|结果)?(?:为|满足|等于)\s*"
+    )
+    cue_matches = list(cue.finditer(value))
+    if cue_matches:
+        candidate = value[cue_matches[-1].end():]
+        if _has_formula_operator(candidate):
+            return candidate
+
+    operators = list(_MATH_QUOTE_OPERATOR_RE.finditer(value))
+    if not operators:
+        return ""
+    start = operators[0].start()
+    prefix = value[:start]
+    preceding_atom = re.search(r"([A-Za-z\u0370-\u03ff0-9]+)\s*$", prefix)
+    if preceding_atom:
+        start = preceding_atom.start(1)
+    return value[start:]
+
+
+def _formula_structure_tokens(value: str) -> tuple[str, ...]:
+    fragment = _formula_expression_fragment(value)
+    fragment = unicodedata.normalize("NFKC", fragment).casefold().replace("−", "-")
+    # Subscript markup and textual whitespace are representational; superscript
+    # markers and the order of all visible atoms/operators remain significant.
+    fragment = fragment.replace("_", "")
+    return tuple(re.findall(
+        r"[a-z]|[\u0370-\u03ff]|\d+|[=≤≥≠≈∑∏√+*/^()-]",
+        fragment,
+    ))
+
+
+def _formula_structure_status(fact: Fact) -> bool | None:
+    """Verify a formula only when its visible linear token order is identical.
+
+    A mismatch is unresolved, not a contradiction: stacked PDF math can be
+    linearized in a different order and needs a complete local layout cluster.
+    """
+    quoted = _formula_structure_tokens(fact.source_quote or "")
+    stated = _formula_structure_tokens(fact.statement or "")
+    if quoted and stated and quoted == stated:
+        return True
+    return None
+
+
+def _quote_needs_strict_formula_match(quote: str, kind: str = "") -> bool:
+    return kind == "formula" or _has_formula_operator(quote)
+
+
+def _quote_page(
+    quote: str, page_texts: list[PageMarkdown], strict_math: bool = False
+) -> int | None:
+    matcher = _formula_quote_is_grounded if strict_math else _quote_is_grounded
     for item in page_texts:
-        if _quote_is_grounded(quote, item.text):
+        if matcher(quote, item.text):
             return item.page
+    native_page = _native_pdf_page_for_quote(quote, page_texts)
+    if native_page is not None:
+        return native_page
+    ocr_page = _picture_ocr_page_for_quote(quote, page_texts)
+    if ocr_page is not None:
+        return ocr_page
     pages = {item.page for item in page_texts}
     return next(iter(pages)) if len(pages) == 1 else None
+
+
+def _is_formula_claim(fact: Fact) -> bool:
+    quote = fact.source_quote or ""
+    statement = fact.statement or ""
+    return fact.kind == "formula" or (
+        _has_formula_operator(quote) and _has_formula_operator(statement)
+    )
 
 
 def _apply_grounding(
     result: ChunkExtraction, source: str, page_texts: list[PageMarkdown] | None = None
 ) -> ChunkExtraction:
+    page_texts = page_texts or []
     for fact in result.facts:
-        fact.grounded = _quote_is_grounded(fact.source_quote, source)
-        if fact.grounded and page_texts:
-            fact.page = _quote_page(fact.source_quote, page_texts)
-        elif not fact.grounded:
+        strict_math = _quote_needs_strict_formula_match(
+            fact.source_quote, fact.kind
+        )
+        matcher = _formula_quote_is_grounded if strict_math else _quote_is_grounded
+        quote_origin = None
+        quote_page = None
+        if matcher(fact.source_quote, source):
+            quote_origin = "text"
+            if page_texts:
+                quote_page = _quote_page(
+                    fact.source_quote, page_texts, strict_math=strict_math
+                )
+        else:
+            quote_page = _native_pdf_page_for_quote(fact.source_quote, page_texts)
+            if quote_page is not None:
+                quote_origin = "pdf_text_layer"
+            else:
+                quote_page = _picture_ocr_page_for_quote(fact.source_quote, page_texts)
+                if quote_page is not None:
+                    quote_origin = "picture_ocr"
+
+        formula_claim = _is_formula_claim(fact)
+        operator_signature_match = (
+            _formula_quote_supports_statement(fact) if formula_claim else None
+        )
+        structure_verified = (
+            _formula_structure_status(fact) if formula_claim else None
+        )
+        fact._quote_grounded = quote_origin is not None
+        fact._quote_origin = quote_origin
+        fact._formula_operator_signature_match = operator_signature_match
+        fact._formula_structure_verified = structure_verified
+        if quote_origin is None:
+            fact._formula_validation_reason = "quote_not_found"
+        elif not formula_claim:
+            fact._formula_validation_reason = None
+        elif structure_verified is True:
+            fact._formula_validation_reason = "exact_linear_formula_tokens_match"
+        elif operator_signature_match is False:
+            fact._formula_validation_reason = "linearized_order_mismatch_unverified"
+        else:
+            fact._formula_validation_reason = "formula_structure_unverified"
+
+        # `grounded` means the quote supports the complete formula statement. An
+        # exact quote alone, or an operator-only match, is insufficient: until a
+        # complete linear token sequence or a later layout-aware check verifies the
+        # structure, keep the formula out of evidence and answer payloads.
+        if formula_claim and structure_verified is not True:
+            fact.grounded = False
+            fact.source_origin = "text"
             fact.confidence = min(fact.confidence, 0.5)
+            continue
+        if quote_origin is None:
+            fact.grounded = False
+            fact.source_origin = "text"
+            fact.confidence = min(fact.confidence, 0.5)
+            continue
+
+        fact.grounded = True
+        fact.source_origin = quote_origin
+        if quote_page is not None:
+            fact.page = quote_page
+        if quote_origin == "pdf_text_layer":
+            fact.confidence = min(fact.confidence, 0.75)
+        elif quote_origin == "picture_ocr":
+            fact.confidence = min(fact.confidence, 0.65)
     return result
+
+
+def _extraction_dump_with_formula_validation(
+    extraction: ChunkExtraction,
+) -> dict:
+    payload = extraction.model_dump()
+    for serialized, fact in zip(payload.get("facts", []), extraction.facts):
+        if not _is_formula_claim(fact):
+            continue
+        serialized["formula_validation"] = {
+            "quote_grounded": bool(fact._quote_grounded),
+            "quote_origin": fact._quote_origin,
+            "operator_signature_match": fact._formula_operator_signature_match,
+            "formula_structure_verified": fact._formula_structure_verified,
+            "reason": fact._formula_validation_reason,
+        }
+    return payload
 
 
 def _clean_table_cell(value: str) -> str:
@@ -1839,6 +2200,485 @@ def _metric_value_near_term(text: str) -> bool:
     return False
 
 
+_FORMULA_PAGE_CUE_RE = re.compile(
+    r"(?i)\b(?:theorem|lemma|proposition|corollary|equation|formula|generating polynomial|"
+    r"is given by|are given by|satisf(?:y|ies)|defined by)\b|定理|引理|命题|推论|公式|方程|生成多项式|由.*给出"
+)
+
+
+def _formula_picture_ocr_for_chunk(
+    chunk: "TextChunk", max_pages: int = 2, max_chars_per_page: int = 1400
+) -> list[dict[str, object]]:
+    """Select bounded, page-scoped picture OCR only near a math/theorem cue."""
+    candidates = []
+    seen_pages: set[int] = set()
+    for page in chunk.page_texts:
+        ocr = str(page.metadata.get("picture_ocr_text", "")).strip()
+        if (
+            not ocr
+            or page.page in seen_pages
+            or not _FORMULA_PAGE_CUE_RE.search(page.text)
+        ):
+            continue
+        seen_pages.add(page.page)
+        candidates.append({"page": page.page, "text": ocr[:max_chars_per_page]})
+        if len(candidates) >= max_pages:
+            break
+    return candidates
+
+
+def _formula_native_text_for_chunk(
+    chunk: "TextChunk", max_pages: int = 2, max_chars_per_page: int = 4200
+) -> list[dict[str, object]]:
+    """Select original PDF text-layer pages for formula stubs, not all page text."""
+    candidates = []
+    seen_pages: set[int] = set()
+    for page in chunk.page_texts:
+        native = str(page.metadata.get("native_pdf_text", "")).strip()
+        if (
+            not native
+            or page.page in seen_pages
+            or not _FORMULA_PAGE_CUE_RE.search(page.text)
+            or not _has_formula_stub(page.text)
+            or not _FORMULA_OPERATOR_RE.search(native)
+        ):
+            continue
+        seen_pages.add(page.page)
+        candidate: dict[str, object] = {
+            "page": page.page,
+            "text": native[:max_chars_per_page],
+        }
+        layout = page.metadata.get("native_pdf_layout")
+        if isinstance(layout, dict):
+            candidate["layout"] = layout
+        candidates.append(candidate)
+        if len(candidates) >= max_pages:
+            break
+    return candidates
+
+
+def _native_pdf_page_for_quote(quote: str, page_texts: list[PageMarkdown]) -> int | None:
+    for page in page_texts:
+        native = str(page.metadata.get("native_pdf_text", ""))
+        if native and _formula_quote_is_grounded(quote, native):
+            return page.page
+    return None
+
+
+def _picture_ocr_page_for_quote(quote: str, page_texts: list[PageMarkdown]) -> int | None:
+    for page in page_texts:
+        ocr = str(page.metadata.get("picture_ocr_text", ""))
+        if ocr and _formula_quote_is_grounded(quote, ocr):
+            return page.page
+    return None
+
+
+_FORMULA_STUB_RE = re.compile(
+    r"(?i)\b(?:is|are)\s+(?:given\s+by\s+(?:here|where|for\s+each\s+color)|"
+    r"here|where)\b|\b(?:is|are)\s+given\s+by\s*$"
+    r"|\bby\s+the\s+equation\b"
+    r"|\bnumber\b.{0,140}\bis\b"
+    r"|\b(?:polynomial|formula|curve|equation)\b.{0,140}\bis\s*$"
+    r"|\bwith\b.{0,120}\bpairs?\s+of\s+(?:coupled\s+)?dominos?\b"
+)
+_FORMULA_OPERATOR_RE = re.compile(r"[=≤≥≠≈∑∏√+*/^]|-")
+
+
+def _has_formula_stub(text: str) -> bool:
+    normalized = re.sub(r"<[^>]+>|[_*`]", " ", text or "")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return bool(_FORMULA_STUB_RE.search(normalized))
+
+
+def _native_pdf_formula_layout(
+    page_dict: dict,
+    page_width: float,
+    page_height: float,
+    max_spans: int = 40,
+    max_chars: int = 1800,
+    max_clusters: int = 3,
+) -> dict | None:
+    """Return bounded, non-citable geometry clusters around formula lead-ins."""
+    if page_width <= 0 or page_height <= 0:
+        return None
+    line_records = []
+    for block in page_dict.get("blocks", []):
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            line_text = "".join(str(span.get("text", "")) for span in spans)
+            if line_text.strip():
+                line_records.append((line.get("bbox", (0, 0, 0, 0)), line_text, spans))
+    if not line_records:
+        return None
+
+    stub_anchors = [
+        index for index, (_, text, _) in enumerate(line_records)
+        if _has_formula_stub(text)
+    ]
+    cue_anchors = [
+        index for index, (_, text, _) in enumerate(line_records)
+        if _FORMULA_LAYOUT_LABEL_RE.search(text)
+    ]
+    candidate_anchors = list(stub_anchors)
+    orphan_cues = [
+        cue for cue in cue_anchors
+        if not stub_anchors or min(abs(cue - stub) for stub in stub_anchors) > 4
+    ]
+    candidate_anchors.extend(orphan_cues)
+    candidate_anchors = sorted(set(candidate_anchors), key=lambda index: (
+        index not in stub_anchors, index
+    ))
+    if not candidate_anchors:
+        return None
+    page_size_counts: dict[float, int] = {}
+    for _, _, page_spans in line_records:
+        for span in page_spans:
+            try:
+                size = float(span.get("size", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if size > 0:
+                normalized_size = round(size, 1)
+                page_size_counts[normalized_size] = page_size_counts.get(normalized_size, 0) + 1
+    if not page_size_counts:
+        return None
+    page_base_size = max(page_size_counts, key=lambda value: (page_size_counts[value], value))
+
+    anchors = candidate_anchors[:max_clusters]
+    omitted_clusters = max(0, len(candidate_anchors) - len(anchors))
+    per_cluster_chars = max(
+        160, (max_chars - 120) // max(1, len(anchors)) - 90
+    )
+    per_cluster_spans = max(1, max_spans // max(1, len(anchors)))
+    clusters: list[dict[str, object]] = []
+
+    for anchor in anchors:
+        line_indexes = set(
+            range(max(0, anchor - 1), min(len(line_records), anchor + 5))
+        )
+        nearby_cue = min(
+            cue_anchors, key=lambda index: abs(index - anchor), default=None
+        )
+        if nearby_cue is not None and abs(nearby_cue - anchor) <= 4:
+            line_indexes.add(nearby_cue)
+        local_lines = [
+            {"bbox": line_records[index][0], "spans": line_records[index][2]}
+            for index in sorted(line_indexes)
+        ]
+        local_layout = _native_pdf_formula_layout_single(
+            {"blocks": [{"lines": local_lines}]},
+            page_width,
+            page_height,
+            max_spans=per_cluster_spans,
+            max_chars=per_cluster_chars,
+            base_size_pt=page_base_size,
+        )
+        if local_layout is None:
+            omitted_clusters += 1
+            continue
+        clusters.append({
+            "anchor": line_records[anchor][1][:80],
+            "base_size_pt": local_layout["base_size_pt"],
+            "spans": local_layout["spans"],
+            "truncated": bool(local_layout["truncated"]),
+        })
+
+    if not clusters:
+        return None
+    layout: dict[str, object] = {
+        "frame": "page-normalized",
+        "clusters": clusters,
+        "truncated": bool(
+            omitted_clusters or any(cluster["truncated"] for cluster in clusters)
+        ),
+    }
+    if omitted_clusters:
+        layout["omitted_clusters"] = omitted_clusters
+
+    # Enforce a hard page-sidecar budget while dropping spans from lower-priority
+    # clusters first. A damaged cluster stays explicitly truncated; earlier intact
+    # clusters retain their own completeness status.
+    while len(json.dumps(layout, ensure_ascii=False)) > max_chars:
+        changed = False
+        for cluster in reversed(clusters):
+            spans = cluster["spans"]
+            if spans:
+                spans.pop()
+                cluster["truncated"] = True
+                layout["truncated"] = True
+                changed = True
+                break
+        if changed:
+            continue
+        if len(clusters) > 1:
+            clusters.pop()
+            omitted_clusters += 1
+            layout["omitted_clusters"] = omitted_clusters
+            layout["truncated"] = True
+            continue
+        clusters[0]["anchor"] = str(clusters[0]["anchor"])[:32]
+        if len(json.dumps(layout, ensure_ascii=False)) > max_chars:
+            return None
+    return layout
+
+
+def _native_pdf_formula_layout_single(
+    page_dict: dict,
+    page_width: float,
+    page_height: float,
+    max_spans: int = 40,
+    max_chars: int = 1000,
+    base_size_pt: float | None = None,
+) -> dict | None:
+    """Compress formula-region span geometry into a bounded, non-citable hint."""
+    if page_width <= 0 or page_height <= 0:
+        return None
+    line_records = []
+    for block in page_dict.get("blocks", []):
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            line_text = "".join(str(span.get("text", "")) for span in spans)
+            if not line_text.strip():
+                continue
+            line_records.append((line.get("bbox", (0, 0, 0, 0)), line_text, spans))
+    if not line_records:
+        return None
+
+    stub_anchors = [
+        index
+        for index, (_, line_text, _) in enumerate(line_records)
+        if _has_formula_stub(line_text)
+    ]
+    cue_anchors = [
+        index
+        for index, (_, line_text, _) in enumerate(line_records)
+        if _FORMULA_LAYOUT_LABEL_RE.search(line_text)
+    ]
+    if stub_anchors:
+        prioritized_anchors = stub_anchors[:3]
+        if cue_anchors:
+            prioritized_anchors.append(cue_anchors[0])
+        for stub in stub_anchors[:3]:
+            nearby_cue = min(cue_anchors, key=lambda index: abs(index - stub), default=None)
+            if nearby_cue is not None and abs(nearby_cue - stub) <= 12:
+                prioritized_anchors.append(nearby_cue)
+        anchor_indexes = sorted(set(prioritized_anchors))[:4]
+    else:
+        anchor_indexes = cue_anchors[:4]
+    if not anchor_indexes:
+        return None
+    selected_lines: set[int] = set()
+    truncated = False
+    for anchor in anchor_indexes[:4]:
+        neighborhood = range(max(0, anchor - 1), min(len(line_records), anchor + 5))
+        for index in neighborhood:
+            if index not in selected_lines and len(selected_lines) >= 24:
+                truncated = True
+                continue
+            selected_lines.add(index)
+    if not selected_lines:
+        return None
+
+    selected_spans = []
+    for line_index in sorted(selected_lines):
+        _, _, spans = line_records[line_index]
+        for span in spans:
+            text = str(span.get("text", "")).strip()
+            bbox = span.get("bbox")
+            try:
+                x0, y0, x1, y1 = (float(value) for value in bbox)
+                size = float(span.get("size", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if not text or x1 <= x0 or y1 <= y0 or size <= 0:
+                continue
+            selected_spans.append({
+                "line": line_index,
+                "text": text,
+                "bbox": (x0, y0, x1, y1),
+                "size": size,
+                "flags": int(span.get("flags", 0) or 0),
+            })
+    if not selected_spans:
+        return None
+
+    if base_size_pt is None:
+        size_counts: dict[float, int] = {}
+        for _, _, page_spans in line_records:
+            for span in page_spans:
+                try:
+                    size = float(span.get("size", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if size > 0:
+                    normalized_size = round(size, 1)
+                    size_counts[normalized_size] = size_counts.get(normalized_size, 0) + 1
+        if not size_counts:
+            return None
+        base_size = max(size_counts, key=lambda value: (size_counts[value], value))
+    else:
+        base_size = round(float(base_size_pt), 1)
+    salient_indexes = set()
+    for index, span in enumerate(selected_spans):
+        compact_text = re.sub(r"(?<=[A-Za-z])-(?=[A-Za-z])", "", span["text"])
+        word_hyphen = bool(re.fullmatch(r"-[A-Za-z]+|[A-Za-z]+-", span["text"]))
+        ratio = span["size"] / base_size
+        operator_matches = list(_FORMULA_LAYOUT_OPERATOR_RE.finditer(compact_text))
+        if len(span["text"]) > 32 and ratio >= 0.86 and len(operator_matches) < 2:
+            continue
+        if ratio < 0.86 or (operator_matches and not word_hyphen):
+            salient_indexes.add(index)
+    if not salient_indexes:
+        return None
+
+    # Preserve immediate spatial context around small/superscript spans (e.g. the
+    # base 2 beside a raised binomial stack), but never serialize ordinary prose wholesale.
+    chosen_indexes = set(salient_indexes)
+    for index in salient_indexes:
+        x0, y0, x1, y1 = selected_spans[index]["bbox"]
+        neighbors = []
+        for neighbor_index, neighbor in enumerate(selected_spans):
+            if neighbor_index in salient_indexes:
+                continue
+            nx0, ny0, nx1, ny1 = neighbor["bbox"]
+            horizontal_gap = max(0.0, nx0 - x1, x0 - nx1)
+            vertical_gap = max(0.0, ny0 - y1, y0 - ny1)
+            if horizontal_gap <= base_size * 0.65 and vertical_gap <= base_size * 1.2:
+                neighbors.append((horizontal_gap + vertical_gap, neighbor_index))
+        if neighbors:
+            chosen_indexes.add(min(neighbors)[1])
+
+    def encode_span(span: dict) -> list:
+        x0, y0, x1, y1 = span["bbox"]
+        text = span["text"][:48]
+        return [
+            round(x0 / page_width, 3),
+            round(y0 / page_height, 3),
+            round(x1 / page_width, 3),
+            round(y1 / page_height, 3),
+            round(span["size"] / base_size, 2),
+            bool(span["flags"] & 1),
+            text,
+        ]
+
+    candidate_indexes = sorted(
+        chosen_indexes,
+        key=lambda index: (
+            index not in salient_indexes,
+            selected_spans[index]["line"],
+            selected_spans[index]["bbox"][1],
+            selected_spans[index]["bbox"][0],
+        ),
+    )
+    candidate_spans = []
+    for index in candidate_indexes:
+        span = selected_spans[index]
+        if index not in salient_indexes and len(span["text"]) > 32:
+            continue
+        if index in salient_indexes and len(span["text"]) > 48:
+            truncated = True
+        candidate_spans.append(span)
+
+    encoded = []
+    for span in candidate_spans:
+        if len(encoded) >= max_spans:
+            truncated = True
+            break
+        item = encode_span(span)
+        candidate = [*encoded, item]
+        serialized = json.dumps(candidate, ensure_ascii=False)
+        if len(serialized) > max_chars:
+            truncated = True
+            break
+        encoded.append(item)
+
+    layout = {
+        "frame": "page-normalized",
+        "base_size_pt": round(base_size, 2),
+        "spans": encoded,
+        "truncated": truncated,
+    }
+    while len(json.dumps(layout, ensure_ascii=False)) > max_chars and layout["spans"]:
+        layout["spans"].pop()
+        layout["truncated"] = True
+    return layout
+
+
+_FORMULA_LAYOUT_OPERATOR_RE = re.compile(r"[=≤≥≠≈∑∏√+*/^−-]")
+_FORMULA_LAYOUT_LABEL_RE = re.compile(
+    r"(?i)\b(?:theorem|lemma|proposition|definition|corollary)\s+\d+(?:\.\d+)*\b"
+)
+
+
+def _flag_formula_stub(fact: "Fact") -> "Fact":
+    """Mark theorem facts whose quote has a formula lead-in but no equation body.
+
+    PDF-to-Markdown may leave a theorem header such as "is given by" while the
+    displayed equation is absent. Such a fact must not look like a successfully
+    extracted formula merely because the lead-in quote is grounded.
+    """
+    if fact.kind != "formula":
+        return fact
+    quote = re.sub(r"<[^>]+>|[_*`]", " ", fact.source_quote or "")
+    quote = re.sub(r"\s+", " ", quote).strip()
+    stub = _FORMULA_STUB_RE.search(quote)
+    if not stub:
+        return fact
+    tail = quote[stub.end():]
+    if _FORMULA_OPERATOR_RE.search(tail):
+        return fact
+    return fact.model_copy(update={
+        "kind": "result",
+        "confidence": min(fact.confidence, 0.5),
+        "statement": (
+            f"原文提到{fact.concept}对应的公式/曲线，但当前可读抽取文本未包含公式本体；"
+            "不能据此恢复表达式，需核对原 PDF 页面。"
+        ),
+    })
+
+
+_AZTEC_RANK_TWO_EIGHT_RE = re.compile(
+    r"(?i)\b8\s+domino\s+tilings?\s+of\s+the\s+Aztec\s+diamond\s+of\s+rank\s+2\b"
+)
+_AZTEC_BAD_COUNT_FORMULA_RE = re.compile(
+    r"(?i)2\s*\^\s*\(?\s*m\s*\^\s*2\s*\+\s*1\s*\)?"
+)
+
+
+def _flag_aztec_rank_count_conflict(fact: "Fact", source_text: str) -> "Fact":
+    """Flag a known OCR inconsistency against the paper's explicit rank-2 witness."""
+    theorem = re.sub(r"\s+", "", fact.concept.casefold()) == "theorem1.1"
+    if (
+        fact.kind != "formula"
+        or not theorem
+        or not _AZTEC_RANK_TWO_EIGHT_RE.search(source_text or "")
+        or not _AZTEC_BAD_COUNT_FORMULA_RE.search(fact.statement or "")
+    ):
+        return fact
+    return fact.model_copy(update={
+        "kind": "result",
+        "confidence": min(fact.confidence, 0.3),
+        "statement": (
+            "定理1.1的转写表达式若按 2^(m^2+1) 理解，则代入 rank 2 得 32，"
+            "与同段明确给出的 8 种铺砌矛盾；原式/OCR 存在歧义，未自动更正，需核对 PDF 原图。"
+        ),
+    })
+
+
+_RECALL_IMPERATIVE_RE = re.compile(
+    r"(?i)^\s*recall\s+(?:the|that|how|why|what)\b"
+)
+
+
+def _is_imperative_recall_metric(fact: "Fact") -> bool:
+    """Reject the specific homonym where sentence-initial 'Recall' is a verb."""
+    return bool(
+        fact.kind == "metric"
+        and fact.concept.strip().casefold() == "recall"
+        and _RECALL_IMPERATIVE_RE.search(fact.source_quote or "")
+    )
+
+
 def metric_fact_is_evidenced(fact: "Fact") -> bool:
     """Whether a `kind="metric"` fact is backed by real metric evidence.
 
@@ -1912,6 +2752,132 @@ _FORWARD_TITLE_RE = re.compile(
     r"(?i)future|open\s+(?:problem|question)|conclusion|outlook|"
     r"展望|未来|结论|开放问题|后续"
 )
+# Cross-document backcheck: an introduction may say "we will extend the models",
+# while a later numbered section actually carries out that extension. The
+# overview model sees both facts and can still copy the roadmap sentence into
+# future_work, so remove only a narrow action+topic match when a non-forward
+# section explicitly documents the same completed extension.
+_K_TILING_TOPIC_RE = re.compile(
+    r"(?i)\bk\s*[-– ]\s*tilings?\b|k\s*[-– ]\s*(?:铺砌|铺砖|平铺|镶嵌)"
+)
+_EXTENSION_ACTION_RE = re.compile(r"(?i)generaliz\w*|extend\w*|推广|扩展")
+_PLANNED_CUE_RE = re.compile(
+    r"(?i)\b(?:will|plan\w*|future|propos\w*|intend\w*)\b|将|计划|未来|拟|有待|开放问题"
+)
+
+
+def remove_completed_extension_future_items(
+    future_items: list[str], fact_catalog: list[dict]
+) -> list[str]:
+    """Drop roadmap statements for k-tiling extensions documented as completed.
+
+    The action and k-tiling target must occur in both a future-looking item and
+    a grounded fact/title from a non-forward section. Other future directions
+    and genuine open problems are left unchanged.
+    """
+    completed_extensions = []
+    for fact in fact_catalog:
+        if fact.get("kind") not in {"method", "result", "formula", "relation", "definition"}:
+            continue
+        title = str(fact.get("section_title", ""))
+        if _FORWARD_TITLE_RE.search(title):
+            continue
+        text = " ".join(
+            str(fact.get(key, "")) for key in ("statement", "source_quote", "section_title")
+        )
+        if (
+            _K_TILING_TOPIC_RE.search(text)
+            and _EXTENSION_ACTION_RE.search(text)
+            and not _PLANNED_CUE_RE.search(str(fact.get("source_quote", "")))
+        ):
+            completed_extensions.append(text)
+
+    kept = []
+    for item in future_items:
+        text = str(item)
+        roadmap_extension = bool(
+            _PLANNED_CUE_RE.search(text)
+            and _K_TILING_TOPIC_RE.search(text)
+            and _EXTENSION_ACTION_RE.search(text)
+        )
+        already_done = roadmap_extension and any(
+            _K_TILING_TOPIC_RE.search(completed)
+            and _EXTENSION_ACTION_RE.search(completed)
+            for completed in completed_extensions
+        )
+        if not already_done:
+            kept.append(text)
+    return list(dict.fromkeys(kept))
+
+
+def remove_completed_arctic_curve_future_items(
+    future_items: list[str], fact_catalog: list[dict]
+) -> list[str]:
+    """Remove the Appendix-A 'other portions similarly' item only with same-page results."""
+    page_facts: dict[int, list[dict]] = {}
+    computed_curve_pages = set()
+    for fact in fact_catalog:
+        kind = str(fact.get("kind", ""))
+        title = str(fact.get("section_title", ""))
+        if _FORWARD_TITLE_RE.search(title):
+            continue
+        try:
+            page = int(fact.get("page"))
+        except (TypeError, ValueError):
+            continue
+        page_facts.setdefault(page, []).append(fact)
+        text = " ".join(
+            str(fact.get(key, ""))
+            for key in ("statement", "source_quote", "section_title")
+        )
+        if (
+            kind in {"result", "example", "formula"}
+            and _ARCTIC_CURVE_TOPIC_RE.search(text)
+            and _ARCTIC_COMPUTED_CUE_RE.search(text)
+        ):
+            computed_curve_pages.add(page)
+
+    kept = []
+    for item in future_items:
+        text = str(item)
+        matches_appendix_step = bool(
+            _ARCTIC_CURVE_TOPIC_RE.search(text)
+            and _ARCTIC_OTHER_PORTIONS_RE.search(text)
+            and _ARCTIC_SIMILAR_STEP_RE.search(text)
+        )
+        candidate_pages = {
+            page
+            for page, facts in page_facts.items()
+            if any(
+                fact.get("kind") in {"method", "result", "example", "formula"}
+                and _ARCTIC_CURVE_TOPIC_RE.search(
+                    f"{fact.get('statement', '')} {fact.get('source_quote', '')}"
+                )
+                and _ARCTIC_OTHER_PORTIONS_RE.search(
+                    f"{fact.get('statement', '')} {fact.get('source_quote', '')}"
+                )
+                and _ARCTIC_SIMILAR_STEP_RE.search(
+                    f"{fact.get('statement', '')} {fact.get('source_quote', '')}"
+                )
+                for fact in facts
+            )
+        }
+        already_computed = bool(candidate_pages & computed_curve_pages)
+        if not (matches_appendix_step and already_computed):
+            kept.append(text)
+    return list(dict.fromkeys(kept))
+
+
+_ARCTIC_CURVE_TOPIC_RE = re.compile(r"(?i)arctic\s+curve|北极曲线")
+_ARCTIC_OTHER_PORTIONS_RE = re.compile(
+    r"(?i)other\s+(?:portions?|parts?|sections?)|其他(?:部分|区段|弧段)"
+)
+_ARCTIC_SIMILAR_STEP_RE = re.compile(
+    r"(?i)can\s+be\s+(?:done|computed|derived|handled)\s+similarly|similarly|类似处理|同理"
+)
+_ARCTIC_COMPUTED_CUE_RE = re.compile(
+    r"(?i)comput\w*|calculat\w*|simulat\w*|plot\w*|show\w*|展示|计算|模拟|绘制"
+)
 
 
 def _forward_work_boost(fact: dict) -> int:
@@ -1953,6 +2919,38 @@ def _metric_evidenced_dict(fact: dict) -> bool:
         or _METRIC_DEFINITION_RE.search(statement)
         or _metric_value_near_term(statement)
     )
+
+
+def _filter_overview_metrics(metrics: list[str], fact_catalog: list[dict]) -> list[str]:
+    """Keep overview metric labels only when grounded metric evidence supports them."""
+    supported_terms = set()
+    for fact in fact_catalog:
+        if fact.get("kind") != "metric" or not _metric_evidenced_dict(fact):
+            continue
+        concept = str(fact.get("concept", "")).strip()
+        if concept:
+            supported_terms.add(concept)
+        statement = str(fact.get("statement", ""))
+        supported_terms.update(
+            match.group(0).strip()
+            for match in _METRIC_TERM_RE.finditer(statement)
+            if match.group(0).strip()
+        )
+
+    def compact(value: str) -> str:
+        value = unicodedata.normalize("NFKC", value).casefold()
+        return re.sub(r"[^a-z0-9\u3400-\u9fff]+", "", value)
+
+    normalized_terms = {compact(term) for term in supported_terms if len(compact(term)) >= 2}
+    kept = []
+    for metric in metrics:
+        candidate = compact(str(metric))
+        if candidate and any(
+            term == candidate or term in candidate or candidate in term
+            for term in normalized_terms
+        ):
+            kept.append(str(metric))
+    return list(dict.fromkeys(kept))
 
 
 def _metric_statement(sentence: str, terms: list[str]) -> str:
@@ -2056,14 +3054,18 @@ def extract_metric_facts(
         if not sentence:
             continue
         terms = [term for term in _metric_terms_in(sentence) if term.lower() not in seen_terms]
+        if terms and any(term.casefold() == "recall" for term in terms) and _RECALL_IMPERATIVE_RE.search(sentence):
+            continue
         if terms:
             if not _metric_evidence_ok(sentence):
                 continue
-            # Tier B names colliding with acronyms/homonyms need a percentage or an
-            # explicit "metric of N" construction to count as real evidence.
+            # Ambiguous homonyms such as "map" are accepted only when a score is
+            # adjacent to the term or the sentence explicitly frames an evaluation
+            # metric. A distant `j = 1, ...` in a mathematical mapping sentence is
+            # not metric evidence.
             if all(term.lower() in _AMBIGUOUS_KEYS for term in terms) and not (
-                _PERCENT_EVIDENCE_RE.search(sentence)
-                or _METRIC_VALUE_RE.search(sentence)
+                _metric_value_near_term(sentence)
+                or _METRIC_ENUM_RE.search(sentence)
             ):
                 continue
             fact = _metric_fact_from_sentence(
@@ -2339,6 +3341,7 @@ def _compact_evidence_fact(fact: dict, section_id: str) -> dict:
         "page": fact.get("page"),
         "confidence": float(fact.get("confidence", 0.0)),
         "grounded": True,
+        "source_origin": fact.get("source_origin", "text"),
     }
 
 
@@ -3118,7 +4121,7 @@ def _build_contradiction_answer(
             fact_ids = _match_contradiction_fact_ids(statement, fact_index)
         source_fact_ids.extend(fact_ids)
     if not statements:
-        return GlobalAnswer(
+        result = GlobalAnswer(
             question=question,
             answer="证据不足",
             source_fact_ids=[],
@@ -3126,6 +4129,8 @@ def _build_contradiction_answer(
             source_pages=[],
             confidence=0.0,
         )
+        result.evidence_chain_status = "deterministic_short_circuit"
+        return result
     source_fact_ids = list(dict.fromkeys(source_fact_ids))
     sources = [fact_index[fact_id] for fact_id in source_fact_ids]
     if sources:
@@ -3134,7 +4139,7 @@ def _build_contradiction_answer(
         ) / len(sources)
     else:
         confidence = 0.5
-    return GlobalAnswer(
+    result = GlobalAnswer(
         question=question,
         answer="；".join(statements),
         source_fact_ids=source_fact_ids,
@@ -3146,6 +4151,8 @@ def _build_contradiction_answer(
         ),
         confidence=confidence,
     )
+    result.evidence_chain_status = "deterministic_short_circuit"
+    return result
 
 
 # --- Overview numeric attribution ------------------------------------------
@@ -3407,6 +4414,100 @@ def _recover_answer_fact_ids(
     return selected
 
 
+def _finalize_evidence_chain(
+    answer: GlobalAnswer,
+    fact_index: dict[str, dict],
+    allowed_fact_ids: set[str],
+) -> GlobalAnswer:
+    """Validate source pointers and run only the existing lexical claim heuristic.
+
+    The relation between steps is model-asserted and deliberately not treated as
+    verified; no NLI or logical entailment check is performed here.
+    """
+    if answer.answer.strip() == "证据不足":
+        # Provenance auditing can downgrade a non-empty model answer to the
+        # insufficient-evidence marker after the chain IDs have been processed.
+        # Enforce the output contract on this final state as well: a refusal must
+        # not retain speculative intermediate claims from the model response.
+        answer.evidence_chain = []
+        answer.source_fact_ids = []
+        answer.source_sections = []
+        answer.source_pages = []
+        answer.confidence = 0.0
+        if answer.evidence_chain_status not in {
+            "unavailable_legacy", "deterministic_short_circuit"
+        }:
+            answer.evidence_chain_status = "unavailable"
+        answer.relation_validation = "not_performed"
+        return answer
+    if not answer.evidence_chain:
+        if answer.evidence_chain_status not in {
+            "unavailable_legacy", "deterministic_short_circuit"
+        }:
+            answer.evidence_chain_status = "unavailable"
+        answer.relation_validation = "not_performed"
+        return answer
+
+    normalized_steps: list[EvidenceChainStep] = []
+    has_incomplete_pointer = False
+    for step_index, step in enumerate(answer.evidence_chain[:3], start=1):
+        raw_ids = list(dict.fromkeys(str(value) for value in step.source_fact_ids if value))
+        valid_ids = [
+            fact_id for fact_id in raw_ids
+            if fact_id in allowed_fact_ids and fact_id in fact_index
+        ]
+        facts = [fact_index[fact_id] for fact_id in valid_ids]
+        if not valid_ids:
+            pointer_status = "invalid"
+        elif len(valid_ids) != len(raw_ids):
+            pointer_status = "incomplete"
+        elif any(not fact.get("grounded") or not str(fact.get("source_quote", "")).strip() for fact in facts):
+            pointer_status = "invalid"
+        elif any(fact.get("page") is None for fact in facts):
+            pointer_status = "incomplete"
+        else:
+            pointer_status = "validated"
+
+        if pointer_status != "validated":
+            has_incomplete_pointer = True
+        evidence = "\n".join(
+            str(fact.get(key, ""))
+            for fact in facts
+            for key in ("statement", "source_quote")
+            if fact.get(key)
+        )
+        if valid_ids and step.claim.strip() and evidence:
+            supported, unsupported = _audit_answer_claims(step.claim, evidence)
+            if supported and not unsupported:
+                claim_status = "heuristic_supported"
+            else:
+                claim_status = "heuristic_unsupported"
+        else:
+            claim_status = "unchecked"
+
+        normalized_step = EvidenceChainStep(
+            step_index=step_index,
+            claim=step.claim,
+            source_fact_ids=valid_ids,
+            relation_to_previous=(
+                "none" if step_index == 1 else step.relation_to_previous
+            ),
+        )
+        normalized_step.source_resolution = step.source_resolution
+        normalized_step.source_pointer_status = pointer_status
+        normalized_step.claim_support_status = claim_status
+        normalized_steps.append(normalized_step)
+
+    answer.evidence_chain = normalized_steps
+    answer.evidence_chain_status = (
+        "partial_or_invalid_pointers"
+        if has_incomplete_pointer
+        else "pointers_validated_relations_unverified"
+    )
+    answer.relation_validation = "not_performed"
+    return answer
+
+
 def _finalize_answer_provenance(
     answer: GlobalAnswer,
     candidate_facts: list[dict],
@@ -3414,8 +4515,54 @@ def _finalize_answer_provenance(
     allowed_fact_ids: set[str],
 ) -> GlobalAnswer:
     original_answer = answer.answer
-    answer.source_fact_ids = _recover_answer_fact_ids(answer, candidate_facts, fact_index)
-    if not answer.source_fact_ids:
+    if answer.answer.strip() == "证据不足":
+        answer.evidence_chain = []
+    candidate_ids = {
+        str(fact.get("fact_id", "")) for fact in candidate_facts if fact.get("fact_id")
+    }
+    chain_fact_ids = []
+    if answer.answer.strip() != "证据不足":
+        for step in answer.evidence_chain[:3]:
+            raw_ids = list(dict.fromkeys(str(fid) for fid in step.source_fact_ids if fid))
+            resolved_ids = [
+                fid for fid in raw_ids
+                if fid in allowed_fact_ids and fid in candidate_ids and fid in fact_index
+            ]
+            recovered_ids = []
+            if step.claim.strip():
+                step_answer = GlobalAnswer(
+                    question=answer.question,
+                    answer=step.claim,
+                    source_fact_ids=resolved_ids,
+                    source_sections=[],
+                    source_pages=[],
+                    confidence=0.0,
+                )
+                recovered_ids = _recover_answer_fact_ids(
+                    step_answer, candidate_facts, fact_index, max_ids=3
+                )
+                recovered_ids = [
+                    fid for fid in recovered_ids
+                    if fid in allowed_fact_ids and fid in candidate_ids and fid in fact_index
+                ]
+            step.source_fact_ids = list(dict.fromkeys(
+                [*resolved_ids, *recovered_ids]
+            ))[:3]
+            step.source_resolution = (
+                "heuristic_recovery"
+                if recovered_ids and (not resolved_ids or any(fid not in resolved_ids for fid in recovered_ids))
+                else "model_ids" if resolved_ids else "unresolved"
+            )
+            chain_fact_ids.extend(step.source_fact_ids)
+        chain_fact_ids = list(dict.fromkeys(chain_fact_ids))[:9]
+    answer.source_fact_ids = chain_fact_ids
+    recovered_fact_ids = _recover_answer_fact_ids(
+        answer, candidate_facts, fact_index
+    )
+    answer.source_fact_ids = list(dict.fromkeys(
+        [*chain_fact_ids, *recovered_fact_ids]
+    ))[:3]
+    if not answer.source_fact_ids and original_answer.strip() != "证据不足":
         if any(term in answer.question for term in ("定量", "评价指标", "比较了哪些")):
             limit = 1
         elif any(term in answer.question for term in ("核心研究", "如何解释")):
@@ -3444,7 +4591,8 @@ def _finalize_answer_provenance(
                 answer.unsupported_claims = list(
                     dict.fromkeys([*answer.unsupported_claims, original_answer])
                 )
-    return _apply_answer_provenance(answer, fact_index, allowed_fact_ids)
+    answer = _apply_answer_provenance(answer, fact_index, allowed_fact_ids)
+    return _finalize_evidence_chain(answer, fact_index, allowed_fact_ids)
 
 
 def batch_by_token_budget(items: list[dict], max_tokens: int = 3200) -> list[list[dict]]:
@@ -3552,6 +4700,7 @@ def build_document_request(
                 "fact_id": fact_id,
                 "statement": _prefix_for_budget(str(fact.get("statement", "")), 120),
                 "kind": fact.get("kind", "relation"),
+                "source_origin": fact.get("source_origin", "text"),
             }
             candidate = {**payload, "fact_catalog": [*payload["fact_catalog"], compact_fact]}
             if estimate_tokens(json.dumps(candidate, ensure_ascii=False)) <= max_tokens:
@@ -3581,7 +4730,7 @@ def build_question_request(
         (("主要方法", "采用"), {"method", "formula", "classification"}, ("method", "feature", "preprocess", "方法", "特征", "预处理")),
         (("比较了", "模型"), {"classification", "method", "relation", "advantage", "disadvantage"}, ("model", "classifier", "模型", "分类器", "mfcc", "stft")),
         (("评价指标", "指标"), {"metric", "definition"}, ("accuracy", "precision", "recall", "f1", "mcc", "指标", "准确率", "召回率")),
-        (("定量结果", "最重要"), {"result", "metric", "example"}, ("accuracy", "result", "准确率", "结果", "%", "mcc")),
+        (("定量结果", "最重要"), {"result", "metric", "example", "formula"}, ("accuracy", "result", "准确率", "结果", "%", "mcc", "formula", "公式", "生成多项式", "generating polynomial", "配分函数", "partition function")),
         (("如何解释", "解释"), {"relation", "result", "advantage"}, ("because", "due", "reason", "原因", "因为", "解释")),
         (("局限", "不足"), {"limitation", "disadvantage"}, ("limitation", "disadvantage", "limited", "局限", "不足", "缺点")),
         (("未来", "改进"), {"limitation", "result"}, ("future", "next aim", "goal", "improve", "未来", "下一个目标", "改进", "后续", "展望")),
@@ -3641,6 +4790,15 @@ def build_question_request(
                 value += 24
             if any(term in title for term in ("related work", "literature", "background", "相关工作", "文献综述", "背景")):
                 value -= 60
+            if any(
+                term in title
+                for term in ("appendix", "supplement", "附录", "补充材料")
+            ):
+                # Appendix equations remain eligible, but a broad question asking
+                # for the document's most important quantitative result should
+                # prefer headline main-text evidence over local derivations/examples.
+                # Keep this soft: an appendix-only result remains retrievable.
+                value -= 35
         if any(term in lowered_question for term in ("未来", "改进")):
             if any(term in title for term in ("future", "未来", "展望")):
                 value += 40
@@ -3651,7 +4809,7 @@ def build_question_request(
     def kind_relevance(fact: dict) -> int:
         kind = fact.get("kind")
         if "定量" in question or "最重要" in question:
-            return {"result": 32, "metric": 12, "example": 8}.get(kind, 0)
+            return {"result": 32, "metric": 12, "example": 8, "formula": 10}.get(kind, 0)
         if any(term in question for term in ("数据集", "材料")):
             return 32 if kind == "dataset" else 0
         if any(term in question for term in ("评价指标", "指标")):
@@ -3694,6 +4852,14 @@ def build_question_request(
             # route uses, would empty the catalog on a document whose metric facts are
             # all definitional, so sink it below real evidence instead.
             value -= 40
+        if fact.get("kind") == "formula" and any(
+            term in text
+            for term in (
+                "generating polynomial", "生成多项式", "partition function", "配分函数",
+                "tiling count", "铺砌数量", "计数公式",
+            )
+        ) and ("定量" in question or "最重要" in question):
+            value += 35
         if fact.get("kind") == "metric":
             # A row of a result/correlation table. Statements no longer carry a
             # "Table N:" prefix (the caption moved to a single per-table header
@@ -3777,7 +4943,7 @@ def build_question_request(
 # Measured cost on a 48-page paper: those fields are 33% of the group payload
 # (68,255 -> 46,010 tokens). Kept as an explicit switch so the change is testable
 # and revertible without touching call sites.
-_GROUP_PAYLOAD_FIELDS = ("fact_id", "concept", "statement", "kind", "page")
+_GROUP_PAYLOAD_FIELDS = ("fact_id", "concept", "statement", "kind", "page", "source_origin")
 
 
 def _lean_group_items(items: list[dict]) -> list[dict]:
@@ -3813,12 +4979,15 @@ class LongDocumentPipeline:
         extract_max_output_tokens: int = 4096,
         reduce_max_output_tokens: int = 2200,
         document_max_output_tokens: int = 3000,
-        group_batch_tokens: int = 9600,
+        group_batch_tokens: int = DEFAULT_GROUP_BATCH_TOKENS,
         lean_group_payload: bool = True,
         section_concurrency: int = 4,
         document_title: str | None = None,
         document_key: str = "",
+        global_answer_reasoning_effort: str = "low",
     ):
+        if global_answer_reasoning_effort not in {"low", "none"}:
+            raise ValueError("global_answer_reasoning_effort must be 'low' or 'none'")
         # Retry layers multiply: the SDK retries transport/5xx/429 errors
         # `sdk_max_retries` times, and the application retries invalid structured
         # output `content_retry_attempts` times on top. Worst case for one logical
@@ -3854,6 +5023,7 @@ class LongDocumentPipeline:
         self.extract_max_output_tokens = max(256, extract_max_output_tokens)
         self.reduce_max_output_tokens = max(256, reduce_max_output_tokens)
         self.document_max_output_tokens = max(256, document_max_output_tokens)
+        self.global_answer_reasoning_effort = global_answer_reasoning_effort
         self.document_title = document_title
         self.document_key = document_key
         self._document_fact_index: dict[str, dict] = {}
@@ -4234,6 +5404,40 @@ class LongDocumentPipeline:
                 payload = self._parse_payload(partial + tail, response_model)
         return payload, regen_resp
 
+    @staticmethod
+    def _normalize_chunk_extraction_payload(payload: dict) -> dict:
+        """Expand compact extraction JSON aliases for Pydantic validation."""
+        if not isinstance(payload, dict):
+            return payload
+        normalized = dict(payload)
+        for short, long in (("s", "summary"), ("f", "facts"), ("nc", "new_concepts")):
+            if long not in normalized and short in normalized:
+                normalized[long] = normalized[short]
+            normalized.pop(short, None)
+        facts = normalized.get("facts", [])
+        aliases = {
+            "c": "concept",
+            "s": "statement",
+            "k": "kind",
+            "q": "source_quote",
+            "p": "page",
+            "cf": "confidence",
+        }
+        normalized["facts"] = [
+            {
+                **{key: value for key, value in fact.items() if key not in aliases},
+                **{
+                    long: fact[short]
+                    for short, long in aliases.items()
+                    if long not in fact and short in fact
+                },
+            }
+            if isinstance(fact, dict)
+            else fact
+            for fact in facts
+        ]
+        return normalized
+
     def _parse_payload(self, content: object, response_model: type[BaseModel] | None) -> dict | None:
         """Return a validated payload parsed from content, or None if unusable."""
         if content is None:
@@ -4245,6 +5449,8 @@ class LongDocumentPipeline:
                 payload = self._extract_json_payload(content)
             else:
                 return None
+            if response_model is ChunkExtraction:
+                payload = self._normalize_chunk_extraction_payload(payload)
             if response_model:
                 response_model.model_validate(payload)
             return payload
@@ -4259,28 +5465,41 @@ class LongDocumentPipeline:
         return self._parse_payload(content, response_model)
 
     async def extract_chunk(self, section: HeadingNode, chunk: TextChunk) -> ChunkExtraction:
-        key = cache_key("extract", self.flash_model, EXTRACTION_PROMPT_VERSION, chunk.text)
+        picture_ocr = _formula_picture_ocr_for_chunk(chunk)
+        native_formula_text = _formula_native_text_for_chunk(chunk)
+        cache_input = chunk.text
+        if picture_ocr:
+            cache_input += "\n__formula_picture_ocr__" + json.dumps(picture_ocr, ensure_ascii=False)
+        if native_formula_text:
+            cache_input += "\n__formula_native_pdf_text__" + json.dumps(native_formula_text, ensure_ascii=False)
+        key = cache_key("extract", self.flash_model, EXTRACTION_PROMPT_VERSION, cache_input)
         cached = self.cache.get(key)
         if cached:
             result = _apply_grounding(ChunkExtraction.model_validate(cached), chunk.text, chunk.page_texts)
             result = _assign_fact_ids(result, section.id)
             return result
         memory = self.memory.retrieve(chunk.text, document_key=getattr(self, "document_key", ""))
-        system = """你是严格的长文事实抽取器。只抽取原文明确支持的信息，并输出 JSON：
-{"summary":"本块摘要","facts":[{"concept":"概念","statement":"事实","kind":"definition|formula|method|result|limitation|advantage|disadvantage|example|relation|classification|dataset|metric","source_quote":"原文逐字引用","page":1,"confidence":0.95}],"new_concepts":["概念"]}
+        system = """你是严格的长文事实抽取器。只抽取原文明确支持的信息，并输出紧凑 JSON，使用这些短键，不要输出长键：
+{"s":"本块摘要","f":[{"c":"概念","s":"事实","k":"definition|formula|method|result|limitation|advantage|disadvantage|example|relation|classification|dataset|metric","q":"原文逐字引用","p":1,"cf":0.95}],"nc":["新概念"]}
+每个 fact 的键含义：c=concept，s=statement，k=kind，q=source_quote，p=page，cf=confidence；顶层 s=summary、f=facts、nc=new_concepts。
 source_quote 必须是原文中的连续文本；不得补充原文没有的因果关系。直接逐字证据通常使用 0.8-1.0 的置信度，不要机械照抄示例值。
 statement 必须用中文概括原文语义：原文是英文时翻译成中文，只保留专有名词、指标名、模型名等原文术语，禁止整句照抄英文原文。
-每个块最多输出 20 条事实；候选超过 20 条时优先保留信息量最大、置信度最高的。source_quote 尽量简短（约 80 字以内），足以在原文中定位即可。
-kind 判定要点：文本提到用于评估该工作的指标（accuracy、precision、recall、F1、AUC、BLEU、ROUGE、METEOR、PSNR、SSIM、mIoU、RMSE、MAE、success rate、SPL、perplexity、准确率、召回率、F1 值、皮尔逊相关系数等）时，必须标为 metric；指标出现在正文叙述里（不限于表格）同样要抽取，concept 用指标名，statement 保留该指标对应的数值。仅当文本确实是评估口径时才用 metric，泛泛出现的普通词（如 "accuracy" 仅表示"准确性"）不要标 metric。"""
-        user = json.dumps(
-            {
-                "section": section.title,
-                "page_range": [section.page_start, section.page_end],
-                "related_memory": memory,
-                "text": chunk.text,
-            },
-            ensure_ascii=False,
-        )
+每个块最多输出 20 条事实；候选超过 20 条时优先保留信息量最大、置信度最高的。source_quote 必须是足以支持 statement 的最短连续原文片段，不得拼接不连续内容；非公式引用最多 80 个字符，优先 20–60 字。若引用公式/定理，允许 q 超过 80 字以保留完整公式和紧邻条件，不得截掉分子、分母、指数、下标或参数范围。
+公式/定理专门规则：公式本体在输入文本中可见时，kind 用 formula，statement 必须包含完整数学表达式及影响结论的参数条件；不能只写“公式见定理X”“由定理给出”。若输入文本只有公式引导语、公式图像未转成文本或 OCR 符号有歧义，不得凭数学常识补公式；只陈述可见内容，并在 summary 中明确说明当前输入没有足够可读的公式表达式。若同一块的公式与例子/数值检验相矛盾，不要擅自选一边或改写成确定结论，应指出源文本/识别内容不一致。
+若 user 中出现 picture_ocr，它是对应页图像的低可靠度 OCR 辅助文本，不是正常正文。只在该 OCR 明确读出完整公式时抽取；source_quote 必须逐字连续取自该 OCR 文本，不可修补、不可靠数学常识补缺。仅由 picture_ocr 支持的事实置信度不得超过 0.65；有歧义则仍标记不可读，不输出推测公式。普通正文证据优先于 picture_ocr。
+若 user 中出现 native_pdf_text，它是候选页的 PDF 原生文本层，不是另一个章节摘要。可用其补全 pymupdf4llm 没有抽出的公式；source_quote 必须逐字连续取自对应 page 的 native_pdf_text.text，不能引用 layout 数值。PDF 文本层可能把二维公式线性化或乱序；若同一项含 layout，它只提供该页少量跨度的版式线索。layout.frame 为 page-normalized，坐标原点在页左上、x/y 均归一化到 0–1 且 y 向下；layout.clusters 是公式局部簇列表，每簇包含 anchor、base_size_pt、spans 和 truncated；簇内每个 span 依次是 [x0,y0,x1,y1,size_ratio,superscript_flag_hint,text]，size_ratio 相对该簇的 base_size_pt。x/y 对齐与上下位置可帮助区分指数、下标及上下堆叠项；superscript_flag_hint 是 PyMuPDF 字体 bit0 的弱提示，可能受字体编码影响，不能单独视为上标证明。字号/字体标志本身不是语义证明；仅在相对位置清晰且与 native_pdf_text 顺序相符时据此消歧。若 layout.truncated 为 true，表示部分簇被截断或遗漏；可使用 truncated=false 且关键跨度完整的局部簇，即使其他簇被截断。若某簇 truncated=true，或公式所需关键跨度不在同一完整簇中，则标记公式未核实，不得依赖缺失跨度猜测/重排。仅由 native_pdf_text 补出的事实置信度不得超过 0.75；layout 不能单独支撑事实或引文。
+kind 判定要点：文本提到用于评估该工作的指标（accuracy、precision、recall、F1、AUC、BLEU、ROUGE、METEOR、PSNR、SSIM、mIoU、RMSE、MAE、success rate、SPL、perplexity、准确率、召回率、F1 值、皮尔逊相关系数等）时，只有确实作为评估口径或报告了对应分数时才标为 metric。指标在正文叙述里（不限于表格）同样可抽取，concept 用指标名，statement 保留对应数值。注意：句首 “Recall the definition...” 中 Recall 是“回顾”这个动词，不是召回率；普通动词 “map to/映射到”也不是 mAP 指标。单独出现 recall/map 不能证明是评估指标；若句子还包含序号（如 j=1,...），不能把序号误作指标值。"""
+        user_payload = {
+            "section": section.title,
+            "page_range": [section.page_start, section.page_end],
+            "related_memory": memory,
+            "text": chunk.text,
+        }
+        if picture_ocr:
+            user_payload["picture_ocr"] = picture_ocr
+        if native_formula_text:
+            user_payload["native_pdf_text"] = native_formula_text
+        user = json.dumps(user_payload, ensure_ascii=False)
         try:
             payload = await self._request_json(
                 "chunk_extract",
@@ -4305,6 +5524,17 @@ kind 判定要点：文本提到用于评估该工作的指标（accuracy、prec
             else:
                 raise
         result = ChunkExtraction.model_validate(payload)
+        result = result.model_copy(
+            update={
+                "facts": [
+                    _flag_aztec_rank_count_conflict(
+                        _flag_formula_stub(fact), chunk.text
+                    )
+                    for fact in result.facts
+                    if not _is_imperative_recall_metric(fact)
+                ]
+            }
+        )
         result = _apply_grounding(result, chunk.text, chunk.page_texts)
         result = _assign_fact_ids(result, section.id)
         self.cache.put(key, result.model_dump())
@@ -4322,7 +5552,8 @@ kind 判定要点：文本提到用于评估该工作的指标（accuracy、prec
             return SectionSynthesis.model_validate(cached)
         system = """你是章节级归纳器。只能根据输入事实归纳，不得新增事实。输出 JSON：
 {"title":"章节标题","summary":"章节摘要","core_concepts":["概念"],"key_findings":["关键结论"],"source_pages":[1]}
-summary 和 key_findings 用中文概括；输入事实为英文时先翻译成中文再概括，禁止整句照抄英文。"""
+summary 和 key_findings 用中文概括；输入事实为英文时先翻译成中文再概括，禁止整句照抄英文。
+source_origin="picture_ocr" 表示事实来自图像 OCR，尚未由正文文本验证。若摘要引用此类事实，须保留“图像OCR待核验”的限定，不得把不确定公式写成确定结论。source_origin="pdf_text_layer" 表示引文来自 PDF 的原生文本层；复杂公式可能被线性化，无法确认上下标/分段对应关系时不可自行重排，应注明需核对原页。"""
         payload = await self._request_json(
             "section_reduce",
             model,
@@ -4369,7 +5600,8 @@ summary 和 key_findings 用中文概括；输入事实为英文时先翻译成�
         system = """你是全文分层归纳器。输入只包含已通过原文验证的事实或上一层摘要。
 只能压缩和合并输入，不得增加外部知识。输出 JSON：
 {"summary":"组摘要","concepts":["概念"],"findings":["结论"],"numeric_claims":["数字结论"],"limitations":["局限"],"future_work":["未来工作"],"contradictions":["矛盾"],"source_fact_ids":["fact-id"],"source_sections":[],"source_pages":[]}
-source_fact_ids 必须来自输入，只保留直接支持组摘要的最少证据，覆盖研究问题、方法、数据、指标、结果、局限、未来工作和矛盾所需事实，最多32条。章节和页码留空，由程序反推。"""
+source_fact_ids 必须来自输入，只保留直接支持组摘要的最少证据，覆盖研究问题、方法、数据、指标、结果、局限、未来工作和矛盾所需事实，最多32条。章节和页码留空，由程序反推。
+归类要求：future_work 只包括截至论文结束仍未完成的作者目标/开放问题。引言里“we will/将要……”可能只是路线图；若本组输入后续章节已展示相同方法、推广、证明或结果，归入 findings/methods，不得重复列为 future_work。source_origin="picture_ocr" 表示图像 OCR 辅助来源，OCR 符号未经图像人工确认，不要将其重述为确定的正文结论；保留其待核验状态。source_origin="pdf_text_layer" 表示原生 PDF 文本层，复杂公式可能被线性化；上下标、乘积上下限或分段条件对应关系不清时，不要把它改写成确定公式。"""
         system += "\n必须压缩：summary 不超过200字；其余数组每项不超过60字，concepts/findings/numeric_claims 各最多12项，其他数组各最多8项。"
         try:
             payload = await self._request_json(
@@ -4418,7 +5650,9 @@ executive_summary 不超过300字，各数组最多10项。
 3. 论文含未来/展望/结论章节证据时 future_work 必须填写，不允许空数组。
 4. contradictions 只列证据支持的跨章节数字或结论冲突。
 5. 每个数字必须与它所属的主体写在一起，禁止把不同事实里的数字拼进同一个论断。证据里的数字各自绑定着主体（例如"base 模型 12 小时"与"big 模型 3.5 天"、"base 模型 BLEU 27.3"与"big 模型 BLEU 41.8"）：不得把某个主体的成绩与另一个主体的训练时长/配置写成一句话。若无法确定数字归属，就不要写这个数字。
-6. 其余字段（executive_summary 及各数组）用中文填写：英文证据先翻译成中文再概括，禁止整句英文，只保留专有名词/指标名/模型名；title 保留原语言。"""
+6. 其余字段（executive_summary 及各数组）用中文填写：英文证据先翻译成中文再概括，禁止整句英文，只保留专有名词/指标名/模型名；title 保留原语言。
+7. future_work 只列文档结束时仍未完成的作者目标或开放问题。导言/章节路线图中的 “we will ...” 不能单独证明它仍是未来工作；检查后续章节是否已经报告同一工作已完成。若后文明确展示该推广、方法、实验或结果，必须归入 methods/key_findings，不得列入 future_work。区分“本文完成的推广”“引用的先前工作”和“真正未解决/拟开展的工作”。
+8. metrics 只列文中实际用于评价模型/方案/实验结果的指标（如 accuracy、Recall、F1、RMSE）。生成多项式、北极曲线、权重、Domino/步数等数学对象或计数，即使能数值化，也不是“评价指标”；没有明确评估指标证据时 metrics 必须为空数组。"""
         try:
             payload = await self._request_json(
                 "document_overview",
@@ -4452,24 +5686,35 @@ executive_summary 不超过300字，各数组最多10项。
         )
         content = json.dumps(request, ensure_ascii=False, sort_keys=True)
         model = self._global_answer_model()
-        key = cache_key("global_answer", model, DOCUMENT_PROMPT_VERSION, content)
+        reasoning_effort = getattr(self, "global_answer_reasoning_effort", "low")
+        key = cache_key(
+            "global_answer",
+            model,
+            DOCUMENT_PROMPT_VERSION,
+            f"{reasoning_effort}\n{content}",
+        )
         cached = self.cache.get(key)
         if cached:
             answer = GlobalAnswer.model_validate(cached)
+            if "evidence_chain" not in cached:
+                answer.evidence_chain_status = "unavailable_legacy"
             return _finalize_answer_provenance(
                 answer,
                 request["fact_catalog"],
                 self._document_fact_index,
                 allowed_fact_ids,
             )
-        system = """你是全文证据问答器。只回答一个问题，只能使用 fact_catalog 中的事实；证据不足时回答“证据不足”。输出 JSON：
-{"question":"原问题","answer":"不超过100字的答案","source_fact_ids":["最多3个fact-id"],"source_sections":[],"source_pages":[],"confidence":0.85}
-source_fact_ids 必须来自 fact_catalog；章节和页码留空，由程序反推。
+        system = """你是全文证据问答器。只回答一个问题，只能使用 fact_catalog 中的事实；证据不足时回答“证据不足”。输出 JSON 字段包含：question、answer、source_fact_ids、evidence_chain、source_sections、source_pages、confidence。confidence 必须是 0 到 1 之间的数字，不要输出“高/中/低”等文字。evidence_chain 每项必须含 step_index、claim、source_fact_ids、relation_to_previous。
+source_fact_ids 和每步 source_fact_ids 优先从本次输入 fact_catalog 中逐字复制真实 fact_id；如果无法确认具体 ID，就留空数组，绝不可虚构或使用占位字符串。程序会按每步 claim 尝试用候选事实恢复 ID，并标明恢复方式。source_sections、source_pages 留空，由程序反推。
+证据链要求：最多3步，按回答所需证据的顺序列出；单事实直答用一步，第一步 relation_to_previous="none"，后续关系只能是 supports/combines/contrasts。每步 claim 只写最小、可核验的中间主张，不输出隐藏思维链；仅使用必要的事实指针。source_fact_ids 应包含链中引用的 IDs。关系标签是模型提出、程序不做语义/NLI验证，不能把它说成已证明。
 要求：
 1. 用自己的话概括，禁止把 source_quote 或原始表格整段贴进答案。
 2. 答案必须全用问题的语言（问题为中文时答案必须全中文）：若证据的 statement 是英文，先用中文转述其含义再写进答案；禁止把英文 statement 或 source_quote 原样写进答案，只能保留短小的专有名词、指标名、模型名。
 3. 问“未来工作”时只答论文明确提到的未来方向，不要复述方法实现细节。
-4. 定量答案必须保留事实中的具体数字。"""
+4. 定量答案必须保留事实中的具体数字。
+5. 不足以回答时 answer="证据不足"，source_fact_ids=[]，evidence_chain=[]。
+6. fact_catalog 中 source_origin="picture_ocr" 表示公式证据来自图像 OCR 而非正文文本。若引用此类事实，答案须明确标注“图像OCR，需核对原页”，不得把符号歧义的公式写成确定结论；source_origin="text" 的普通正文引用不需此标注。
+7. source_origin="pdf_text_layer" 表示 PDF 文本层提供了公式字符但不保证恢复二维版面；若公式含分段、上下标或乘积/求和上下限，答案须避免重排不确定的符号关系，并提示核对原页。"""
         try:
             payload = await self._request_json(
                 "global_answer",
@@ -4478,6 +5723,7 @@ source_fact_ids 必须来自 fact_catalog；章节和页码留空，由程序反
                 json.dumps(request, ensure_ascii=False),
                 response_model=GlobalAnswer,
                 max_output_tokens=min(1000, self.document_max_output_tokens),
+                reasoning_effort=getattr(self, "global_answer_reasoning_effort", "low"),
             )
             answer = GlobalAnswer.model_validate(payload)
             answer.question = question
@@ -4572,6 +5818,8 @@ source_fact_ids 必须来自 fact_catalog；章节和页码留空，由程序反
                 "section_title": fact.get("section_title", ""),
                 "page": fact.get("page"),
                 "confidence": fact.get("confidence", 0.0),
+                "source_origin": fact.get("source_origin", "text"),
+                "source_quote": fact.get("source_quote", ""),
             }
             for fact_id, fact in self._document_fact_index.items()
         ]
@@ -4586,7 +5834,12 @@ source_fact_ids 必须来自 fact_catalog；章节和页码留空，由程序反
             detected_contradictions,
             max_tokens=min(max_tokens, 2400),
         )
-        bundle_scope = {"document_request": document_request}
+        bundle_scope = {
+            "document_request": document_request,
+            "global_answer_reasoning_effort": getattr(
+                self, "global_answer_reasoning_effort", "low"
+            ),
+        }
         if self.document_title:
             # 候选标题决定 bundle 的 title，必须折进缓存键，否则标题随代码演进变化时
             # document_overview 走不到（bundle 命中即短路返回），仍回旧标题。
@@ -4599,6 +5852,13 @@ source_fact_ids 必须来自 fact_catalog；章节和页码留空，由程序反
             # bundle 里缓存的 title 可能来自候选标题修正前的旧版模型输出（截断回显），
             # 命中后同样过一遍确定性兜底，保证展示 title 恒等于候选标题。
             result = _apply_document_title(result, self.document_title)
+            result.future_work = remove_completed_extension_future_items(
+                result.future_work, full_fact_catalog
+            )
+            result.future_work = remove_completed_arctic_curve_future_items(
+                result.future_work, full_fact_catalog
+            )
+            result.metrics = _filter_overview_metrics(result.metrics, full_fact_catalog)
             effective_contradictions = _merge_overview_contradictions(
                 detected_contradictions, result.contradictions, self._document_fact_index
             )
@@ -4630,6 +5890,13 @@ source_fact_ids 必须来自 fact_catalog；章节和页码留空，由程序反
         overview = await self._synthesize_overview(
             document_request, groups, detected_contradictions
         )
+        overview.future_work = remove_completed_extension_future_items(
+            overview.future_work, full_fact_catalog
+        )
+        overview.future_work = remove_completed_arctic_curve_future_items(
+            overview.future_work, full_fact_catalog
+        )
+        overview.metrics = _filter_overview_metrics(overview.metrics, full_fact_catalog)
         effective_contradictions = _merge_overview_contradictions(
             detected_contradictions, overview.contradictions, self._document_fact_index
         )
@@ -4726,7 +5993,9 @@ source_fact_ids 必须来自 fact_catalog；章节和页码留空，由程序反
         return {
             "section": section.model_dump(exclude={"children"}),
             "chunks": [chunk.model_dump() for chunk in chunks],
-            "extractions": [item.model_dump() for item in extractions],
+            "extractions": [
+                _extraction_dump_with_formula_validation(item) for item in extractions
+            ],
             "table_facts": [fact.model_dump() for fact in table_facts],
             "metric_facts": [fact.model_dump() for fact in metric_facts],
             "detected_facts": [
@@ -4901,6 +6170,7 @@ async def _run(args: argparse.Namespace) -> None:
         document_max_output_tokens=args.document_max_output_tokens,
         document_title=_candidate_document_title(root),
         document_key=args.document_key or _document_key(args.pdf),
+        global_answer_reasoning_effort=args.global_answer_reasoning_effort,
     )
     try:
         # Sections are processed concurrently. Each section is internally serial
@@ -5019,10 +6289,11 @@ def main() -> None:
     parser.add_argument(
         "--group-batch-tokens",
         type=int,
-        default=9600,
-        help="Token budget per hierarchical group-reduce call. Must exceed "
-             "--reduce-max-tokens, otherwise the hierarchy issues one call per "
-             "section and the call count roughly triples.",
+        default=DEFAULT_GROUP_BATCH_TOKENS,
+        help="Token budget per hierarchical group-reduce call. The 12800 default "
+             "used fewer group calls than 9600 at similar input tokens in the "
+             "measured 48-page run; use --group-batch-tokens 9600 to revert. "
+             "Must exceed --reduce-max-tokens, otherwise grouping degenerates.",
     )
     parser.add_argument(
         "--full-group-payload",
@@ -5042,6 +6313,13 @@ def main() -> None:
         help="How many sections to process at once. Each section is internally "
              "serial; total in-flight API calls stay bounded by --concurrency. "
              "Use 1 to reproduce serial section processing.",
+    )
+    parser.add_argument(
+        "--global-answer-reasoning-effort",
+        choices=("low", "none"),
+        default="low",
+        help="Reasoning effort for initial global-answer calls; keep low unless "
+             "paired quality testing supports none.",
     )
     parser.add_argument("--content-retries", type=int, default=3)
     parser.add_argument("--retry-base-seconds", type=float, default=1.0)

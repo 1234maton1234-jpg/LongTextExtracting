@@ -20,7 +20,7 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 Copy-Item .env.example .env
 # 然后编辑 .env，把 DEEPSEEK_API_KEY 改成你自己的（示例文件里已写好注释）
 
-# 3. 跑测试确认环境正常（192 个应全部通过）
+# 3. 跑测试确认环境正常（223 个应全部通过）
 powershell -ExecutionPolicy Bypass -File .\test.ps1
 
 # 4. 运行（处理一份 PDF）
@@ -37,6 +37,8 @@ powershell -ExecutionPolicy Bypass -File .\test.ps1
 | `-FlashModel` | `deepseek-v4-flash` | 块抽取使用的模型 |
 | `-ProModel` | `deepseek-v4-pro` | 多块章节归纳使用的模型 |
 | `-DryRun` | 关 | 不调 API，只做预处理 |
+
+全文分组归纳默认使用 `--group-batch-tokens 12800`，可传 `9600` 回退/对照。可用 `--global-answer-reasoning-effort none` 做全局问答推理强度对照（默认仍为 `low`）；改变时会复用抽取、分组和 overview 缓存，只重新请求问答，前提是 PDF、事实缓存及其他参数一致。若通过 `run.ps1`，把这些 Python 参数放在其余 PowerShell 参数之后。
 
 ## 协作
 

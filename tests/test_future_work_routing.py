@@ -25,6 +25,8 @@ from p2g_v2 import (  # noqa: E402
     _FORWARD_ITEM_RE,
     _FORWARD_TITLE_RE,
     _forward_work_boost,
+    remove_completed_extension_future_items,
+    remove_completed_arctic_curve_future_items,
 )
 
 FUTURE_QUESTION = next(q for q in GLOBAL_QUESTIONS if "未来" in q)
@@ -56,6 +58,93 @@ class ForwardItemDetectionTests(unittest.TestCase):
             "We evaluate on the open vocabulary segmentation benchmark.",
         ):
             self.assertIsNone(_FORWARD_ITEM_RE.search(text), text)
+
+
+class CompletedWorkBackcheckTests(unittest.TestCase):
+    def test_removes_appendix_curve_step_only_with_same_page_computation(self):
+        future_items = [
+            "北极曲线的其他部分可类似处理。",
+            "一般 t 下涨落的精确分布仍是开放问题。",
+        ]
+        facts = [
+            {
+                "kind": "method",
+                "section_title": "Appendix A: Proof of Theorem 1.4",
+                "statement": "北极曲线的其他部分可类似处理。",
+                "source_quote": "The other portions of the arctic curve can be done similarly.",
+                "page": 44,
+            },
+            {
+                "kind": "example",
+                "section_title": "Appendix A: Proof of Theorem 1.4",
+                "statement": "图25展示模拟与计算的北极曲线。",
+                "source_quote": "Figure 25: A simulation and computed arctic curve for a hexagon.",
+                "page": 44,
+            },
+        ]
+
+        self.assertEqual(
+            ["一般 t 下涨落的精确分布仍是开放问题。"],
+            remove_completed_arctic_curve_future_items(future_items, facts),
+        )
+
+    def test_keeps_appendix_curve_step_without_same_page_result(self):
+        future_items = ["北极曲线的其他部分可类似处理。"]
+        facts = [{
+            "kind": "method",
+            "section_title": "Appendix A",
+            "statement": "北极曲线的其他部分可类似处理。",
+            "source_quote": "The other portions of the arctic curve can be done similarly.",
+            "page": 44,
+        }, {
+            "kind": "example",
+            "section_title": "Appendix A",
+            "statement": "另一页展示计算的北极曲线。",
+            "source_quote": "Figure 25: A computed arctic curve.",
+            "page": 45,
+        }]
+
+        self.assertEqual(
+            future_items, remove_completed_arctic_curve_future_items(future_items, facts)
+        )
+
+    def test_removes_extension_already_documented_later(self):
+        future_items = [
+            "将把这两种模型推广到k-铺砖，并在k=1时恢复命题2.2的结果。",
+            "寻找命题4.7的组合证明。",
+        ]
+        facts = [{
+            "fact_id": "done-k-extension",
+            "kind": "method",
+            "section_title": "2.4 Extending the models to k-tilings",
+            "statement": "前节的两个模型可以扩展到 k-tilings。",
+            "source_quote": "The two models in the previous section can be extended to k-tilings.",
+        }]
+
+        filtered = remove_completed_extension_future_items(future_items, facts)
+
+        self.assertEqual(["寻找命题4.7的组合证明。"], filtered)
+
+    def test_keeps_plan_when_document_has_no_completion_evidence(self):
+        future_items = ["We will generalize these two models to k-tilings."]
+
+        self.assertEqual(
+            future_items,
+            remove_completed_extension_future_items(future_items, []),
+        )
+
+    def test_does_not_remove_extension_without_completed_evidence(self):
+        future_items = ["作者计划将两种模型推广到k-铺砖。"]
+        facts = [{
+            "kind": "limitation",
+            "section_title": "7 Open Problems",
+            "statement": "k-tilings 尚未推广到此情形。",
+            "source_quote": "We plan to extend the models to k-tilings.",
+        }]
+
+        filtered = remove_completed_extension_future_items(future_items, facts)
+
+        self.assertEqual(future_items, filtered)
 
 
 class ForwardWorkBoostTests(unittest.TestCase):

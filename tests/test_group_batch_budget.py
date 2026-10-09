@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "python_scripts"))
 from p2g_v2 import (  # noqa: E402
     LongDocumentPipeline,
+    DEFAULT_GROUP_BATCH_TOKENS,
     batch_by_token_budget,
     estimate_tokens,
 )
@@ -38,13 +39,16 @@ class GroupBatchBudgetTests(unittest.TestCase):
     def test_default_budget_groups_several_shards_per_call(self):
         shards = _synthetic_shards(30, 2600)
         pipeline = LongDocumentPipeline.__new__(LongDocumentPipeline)
-        pipeline.group_batch_tokens = 9600
+        pipeline.group_batch_tokens = DEFAULT_GROUP_BATCH_TOKENS
 
         group_budget = max(3200, getattr(pipeline, "group_batch_tokens", 3200))
         batches = batch_by_token_budget(shards, group_budget)
+        previous_batches = batch_by_token_budget(shards, 9600)
 
-        # 30 shards of ~2600 tokens must not become ~30 calls.
-        self.assertLess(len(batches), 15)
+        # 30 shards of ~2600 tokens must not become ~30 calls; a wider default
+        # should batch at least as efficiently as the former 9600-token default.
+        self.assertEqual(group_budget, 12800)
+        self.assertLess(len(batches), len(previous_batches))
         self.assertGreater(sum(len(b) for b in batches), len(batches))
 
     def test_a_budget_equal_to_the_shard_budget_degenerates(self):

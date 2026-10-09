@@ -22,6 +22,7 @@ from p2g_v2 import (  # noqa: E402
     DocumentOverview,
     DocumentSynthesis,
     GLOBAL_QUESTIONS,
+    EXTRACTION_PROMPT_VERSION,
     Fact,
     GlobalAnswer,
     GroupSynthesis,
@@ -67,6 +68,16 @@ from p2g_v2 import (  # noqa: E402
     _is_toc_section,
     _noise_node_reason,
     _strip_picture_text,
+    _extract_picture_ocr,
+    _formula_picture_ocr_for_chunk,
+    _formula_native_text_for_chunk,
+    _native_pdf_formula_layout,
+    _native_pdf_page_for_quote,
+    _has_formula_stub,
+    _formula_quote_is_grounded,
+    _formula_quote_supports_statement,
+    _formula_structure_status,
+    _extraction_dump_with_formula_validation,
     shard_section_evidence,
     split_text,
     _quote_is_grounded,
@@ -86,7 +97,12 @@ from p2g_v2 import (  # noqa: E402
     audit_overview_numerics,
     metric_fact_is_evidenced,
     _metric_evidenced_dict,
+    _filter_overview_metrics,
+    _is_imperative_recall_metric,
+    _flag_formula_stub,
+    _flag_aztec_rank_count_conflict,
 )
+from benchmark_run import _extract_only_metrics
 
 
 class MetricFactExtractionTests(unittest.TestCase):
@@ -159,6 +175,14 @@ class MetricFactExtractionTests(unittest.TestCase):
 
         self.assertEqual([], extract_metric_facts(section))
 
+    def test_ignores_recall_verb_even_when_equation_has_integers(self):
+        section = self._section(
+            "Recall the algebraic definition of the L matrix: "
+            "I_i = 1 if color i is present, and 0 otherwise."
+        )
+
+        self.assertEqual([], extract_metric_facts(section))
+
     def test_ignores_english_copula_and_geographic_map(self):
         # "is" and "map" are the worst false-positive generators in real papers.
         section = self._section(
@@ -167,6 +191,24 @@ class MetricFactExtractionTests(unittest.TestCase):
         )
 
         self.assertEqual([], extract_metric_facts(section))
+
+    def test_ignores_map_verb_with_distant_math_indices(self):
+        # Regression for Appendix A: ordinary "map" in a path correspondence was
+        # admitted because a distant loop index `j = 1, ...` counted as its score.
+        section = self._section(
+            "We use the map from the red path to the blue path for j = 1, ..., a."
+        )
+
+        self.assertEqual([], extract_metric_facts(section))
+
+    def test_ambiguous_map_metric_kept_when_score_is_adjacent(self):
+        section = self._section("The detector reports map=0.72 on the test set.")
+
+        facts = extract_metric_facts(section)
+
+        self.assertEqual(1, len(facts))
+        self.assertEqual("map", facts[0].concept.lower())
+        self.assertIn("0.72", facts[0].statement)
 
     def test_ignores_acronym_homonym_without_numeric_evidence(self):
         # "MAE" here is the masked autoencoder, not mean absolute error.
@@ -294,6 +336,7 @@ class MetricEvidenceTests(unittest.TestCase):
             page=45, confidence=0.9, grounded=True,
         )
 
+        self.assertTrue(_is_imperative_recall_metric(fact))
         self.assertFalse(metric_fact_is_evidenced(fact))
 
     def test_statistics_notes_are_not_evidenced_metrics(self):
@@ -318,6 +361,7 @@ class MetricEvidenceTests(unittest.TestCase):
         )
 
         self.assertTrue(metric_fact_is_evidenced(fact))
+        self.assertFalse(_is_imperative_recall_metric(fact))
 
     def test_a_metrics_section_supplies_the_evidence(self):
         # "RoleEval从知识角度客观评估LLM" is a genuine metric with no nearby number.
@@ -329,6 +373,48 @@ class MetricEvidenceTests(unittest.TestCase):
 
         self.assertTrue(_metric_evidenced_dict(evidenced))
         self.assertFalse(_metric_evidenced_dict(unevidenced))
+
+    def test_overview_metrics_drop_math_quantities_without_metric_evidence(self):
+        false_metrics = [
+            {
+                "kind": "metric", "concept": "生成多项式",
+                "statement": "生成多项式定义了铺砖的配分函数。",
+                "section_title": "2 Main Results",
+            },
+            {
+                "kind": "metric", "concept": "北极曲线",
+                "statement": "北极曲线描述冻结区和液态区的边界。",
+                "section_title": "3 Arctic Curves",
+            },
+            {
+                "kind": "metric", "concept": "耦合domino对数",
+                "statement": "耦合domino对数记为 j。",
+                "section_title": "2 Definitions",
+            },
+            {
+                "kind": "metric", "concept": "水平步数量",
+                "statement": "Schroeder 路径的水平步数量。",
+                "section_title": "4 Bijection",
+            },
+            {
+                "kind": "metric", "concept": "保权双射位移步数",
+                "statement": "保权双射改变的位移步数。",
+                "section_title": "5 Results",
+            },
+        ]
+        real_metric = {
+            "kind": "metric", "concept": "Recall",
+            "statement": "模型在测试集上取得 0.82 的 recall。",
+            "section_title": "4 Experiments",
+        }
+
+        result = _filter_overview_metrics(
+            ["生成多项式", "北极曲线", "耦合domino对数", "水平步数量",
+             "保权双射位移步数", "Recall 0.82"],
+            [*false_metrics, real_metric],
+        )
+
+        self.assertEqual(["Recall 0.82"], result)
 
     def test_bogus_metric_leaves_the_metric_route_but_stays_citable(self):
         facts = [
@@ -347,6 +433,580 @@ class MetricEvidenceTests(unittest.TestCase):
 
         self.assertNotIn("fact-36e4049ec6d76c10", allowed)
         self.assertIn("fact-real", allowed)
+
+
+class FormulaFactValidationTests(unittest.TestCase):
+    def test_picture_ocr_is_retained_separately_from_primary_prose(self):
+        raw = (
+            "Theorem 1.3. The polynomial is "
+            "<!-- Start of picture text -->x^2 + y^2 = 1<!-- End of picture text -->"
+        )
+
+        self.assertEqual("x^2 + y^2 = 1", _extract_picture_ocr(raw))
+        self.assertEqual("Theorem 1.3. The polynomial is", _strip_picture_text(raw))
+
+    def test_picture_ocr_is_selected_only_for_math_context_pages_and_is_bounded(self):
+        chunk = TextChunk(
+            index=0,
+            text="Theorem 1.1 is stated.",
+            token_estimate=10,
+            page_texts=[
+                PageMarkdown(page=1, text="Theorem 1.1 is stated.", metadata={
+                    "picture_ocr_text": "a" * 2000,
+                }),
+                PageMarkdown(page=2, text="Figure caption with no theorem.", metadata={
+                    "picture_ocr_text": "not a formula page",
+                }),
+                PageMarkdown(page=3, text="Equation 2 is given by", metadata={
+                    "picture_ocr_text": "x + y = 1",
+                }),
+            ],
+        )
+
+        selected = _formula_picture_ocr_for_chunk(chunk, max_pages=1, max_chars_per_page=50)
+
+        self.assertEqual([1], [item["page"] for item in selected])
+        self.assertEqual(50, len(selected[0]["text"]))
+
+    def test_picture_ocr_quote_is_grounded_as_low_confidence_page_evidence(self):
+        fact = Fact(
+            concept="Theorem 1.3",
+            statement="生成函数满足 x^2 + y^2 = 1。",
+            kind="formula",
+            source_quote="x^2 + y^2 = 1",
+            page=1,
+            confidence=0.95,
+        )
+        page = PageMarkdown(
+            page=4,
+            text="The generating polynomial is given by",
+            metadata={"picture_ocr_text": "x^2 + y^2 = 1"},
+        )
+
+        grounded = _apply_grounding(
+            ChunkExtraction(summary="公式", facts=[fact], new_concepts=[]),
+            page.text,
+            [page],
+        ).facts[0]
+
+        self.assertTrue(grounded.grounded)
+        self.assertEqual("picture_ocr", grounded.source_origin)
+        self.assertEqual(4, grounded.page)
+        self.assertEqual(0.65, grounded.confidence)
+
+    def test_pdf_formula_layout_preserves_stacked_numerator_denominator(self):
+        cue = {
+            "bbox": [40, 80, 380, 92],
+            "spans": [{
+                "text": "Lemma 6.1: with j pairs of coupled dominos",
+                "bbox": [40, 80, 380, 92], "size": 10.0, "flags": 4,
+            }],
+        }
+        formula = {
+            "bbox": [95, 198, 110, 218],
+            "spans": [
+                {"text": "(", "bbox": [96, 198, 100, 213], "size": 10.0, "flags": 4},
+                {"text": "k", "bbox": [100, 199, 104, 206], "size": 7.0, "flags": 7},
+                {"text": "2", "bbox": [100, 209, 104, 216], "size": 7.0, "flags": 4},
+                {"text": ")", "bbox": [104, 198, 108, 213], "size": 10.0, "flags": 4},
+            ],
+        }
+        italic_body = {
+            "bbox": [500, 700, 610, 712],
+            "spans": [{
+                "text": "italic body text",
+                "bbox": [500, 700, 610, 712], "size": 10.0, "flags": 7,
+            }],
+        }
+        page_dict = {"blocks": [{"lines": [cue, formula, italic_body]}]}
+
+        layout = _native_pdf_formula_layout(page_dict, 612, 792)
+
+        self.assertIsNotNone(layout)
+        self.assertEqual(1, len(layout["clusters"]))
+        cluster = layout["clusters"][0]
+        numerator = next(span for span in cluster["spans"] if span[6] == "k")
+        denominator = next(span for span in cluster["spans"] if span[6] == "2")
+        self.assertAlmostEqual(numerator[0], denominator[0], places=3)
+        self.assertLess(numerator[1], denominator[1])
+        self.assertEqual(0.7, numerator[4])
+        self.assertTrue(numerator[5])
+        self.assertFalse(denominator[5])
+        self.assertFalse(cluster["truncated"])
+        self.assertFalse(layout["truncated"])
+        self.assertNotIn("italic body text", [span[6] for span in cluster["spans"]])
+        self.assertLessEqual(
+            len(json.dumps(layout, ensure_ascii=False)), 1800
+        )
+
+    def test_pdf_formula_layout_truncation_is_explicit(self):
+        cue = {
+            "bbox": [0, 0, 250, 10],
+            "spans": [{"text": "Theorem 1.1", "bbox": [0, 0, 100, 10], "size": 10, "flags": 4}],
+        }
+        body_line = {
+            "bbox": [10, 40, 590, 52],
+            "spans": [
+                {
+                    "text": f"word{i}",
+                    "bbox": [10 + i * 38, 40, 34 + i * 38, 52],
+                    "size": 10,
+                    "flags": 4,
+                }
+                for i in range(15)
+            ],
+        }
+        math_line = {
+            "bbox": [20, 20, 500, 35],
+            "spans": [
+                {"text": "x", "bbox": [20 + i * 8, 20, 25 + i * 8, 27], "size": 7, "flags": 7}
+                for i in range(12)
+            ],
+        }
+        layout = _native_pdf_formula_layout(
+            {"blocks": [{"lines": [cue, body_line, math_line]}]},
+            612,
+            792,
+            max_spans=2,
+        )
+
+        self.assertTrue(layout["truncated"])
+        self.assertTrue(layout["clusters"][0]["truncated"])
+        self.assertLessEqual(len(layout["clusters"][0]["spans"]), 2)
+        self.assertLessEqual(len(json.dumps(layout, ensure_ascii=False)), 1800)
+
+    def test_formula_layout_reports_truncation_per_local_cluster(self):
+        def text_line(text, y):
+            words = text.split()
+            spans = []
+            for index, word in enumerate(words):
+                rendered = word + (" " if index < len(words) - 1 else "")
+                x0 = index * 60
+                spans.append({
+                    "text": rendered,
+                    "bbox": [x0, y, x0 + 48, y + 10],
+                    "size": 10,
+                    "flags": 4,
+                })
+            return {"bbox": [0, y, 560, y + 10], "spans": spans}
+
+        def formula_line(tokens, y):
+            return {
+                "bbox": [20, y, 500, y + 10],
+                "spans": [
+                    {
+                        "text": token,
+                        "bbox": [20 + index * 12, y, 26 + index * 12, y + 6],
+                        "size": 7,
+                        "flags": 7,
+                    }
+                    for index, token in enumerate(tokens)
+                ],
+            }
+
+        lines = [
+            text_line("Theorem 1.3. The generating polynomial is given by", 0),
+            formula_line(["∏", "x", "+", "1"], 12),
+            text_line("ordinary context one", 24),
+            text_line("ordinary context two", 36),
+            text_line("ordinary context three", 48),
+            text_line("ordinary context four", 60),
+            text_line("Theorem 1.4. The arctic curve is given by", 72),
+            formula_line(["x"] * 16, 84),
+            text_line("ordinary context five", 96),
+            text_line("ordinary context six", 108),
+            text_line("ordinary context seven", 120),
+        ]
+
+        layout = _native_pdf_formula_layout(
+            {"blocks": [{"lines": lines}]}, 612, 792, max_spans=16
+        )
+
+        self.assertIsNotNone(layout)
+        self.assertEqual(2, len(layout["clusters"]))
+        self.assertFalse(layout["clusters"][0]["truncated"])
+        self.assertTrue(layout["clusters"][1]["truncated"])
+        self.assertTrue(layout["truncated"])
+        self.assertIn("Theorem 1.3", layout["clusters"][0]["anchor"])
+        self.assertIn("Theorem 1.4", layout["clusters"][1]["anchor"])
+        self.assertLessEqual(len(json.dumps(layout, ensure_ascii=False)), 1800)
+
+    def test_formula_layout_geometry_is_included_in_extraction_cache_input(self):
+        def chunk_at(x):
+            page = PageMarkdown(
+                page=4,
+                text="Theorem 1.3. The generating polynomial is given by",
+                metadata={
+                    "native_pdf_text": "Theorem 1.3 x^2 + y^2 = 1",
+                    "native_pdf_layout": {
+                        "frame": "page-normalized",
+                        "clusters": [{
+                            "anchor": "Theorem 1.3",
+                            "base_size_pt": 10.0,
+                            "spans": [[x, 0.2, x + 0.01, 0.21, 0.7, True, "2"]],
+                            "truncated": False,
+                        }],
+                        "truncated": False,
+                    },
+                },
+            )
+            return TextChunk(index=0, text=page.text, token_estimate=20, page_texts=[page])
+
+        first = _formula_native_text_for_chunk(chunk_at(0.4))
+        shifted = _formula_native_text_for_chunk(chunk_at(0.41))
+        first_key = cache_key(
+            "extract", "model", EXTRACTION_PROMPT_VERSION,
+            json.dumps(first, ensure_ascii=False),
+        )
+        shifted_key = cache_key(
+            "extract", "model", EXTRACTION_PROMPT_VERSION,
+            json.dumps(shifted, ensure_ascii=False),
+        )
+
+        self.assertNotEqual(first, shifted)
+        self.assertNotEqual(first_key, shifted_key)
+
+    def test_formula_gap_trigger_covers_equation_count_and_pair_leadins(self):
+        examples = (
+            "We define the weight of a k-tiling by the equation",
+            "The number of domino tilings of rank m is",
+            "Lemma 6.1: with j pairs of coupled dominos",
+        )
+        for text in examples:
+            self.assertTrue(_has_formula_stub(text), text)
+
+        for index, text in enumerate(examples, start=1):
+            page = PageMarkdown(
+                page=index,
+                text=("Theorem " if index == 2 else "Lemma " if index == 3 else "Equation ") + text,
+                metadata={"native_pdf_text": "(k / 2)(m+1 / 2)-j"},
+            )
+            chunk = TextChunk(
+                index=0, text=page.text, token_estimate=20, page_texts=[page]
+            )
+            self.assertEqual(
+                [index], [item["page"] for item in _formula_native_text_for_chunk(chunk)]
+            )
+
+    def test_formula_gap_trigger_ignores_markdown_emphasis(self):
+        theorem_13 = (
+            "**Theorem 1.3.** _The generating polynomial of the k-tilings is_\n\n"
+            "Here t follows the number of coupled dominos."
+        )
+        theorem_14 = (
+            "**Theorem 1.4.** _For the purple-gray model, the arctic curve "
+            "when t = 0 is given by_\n\n_for each color._"
+        )
+
+        self.assertTrue(_has_formula_stub(theorem_13))
+        self.assertTrue(_has_formula_stub(theorem_14))
+
+    def test_native_pdf_text_rescues_a_formula_stub_with_operator_sensitive_grounding(self):
+        formula = "k−1 ∏ ℓ=0 ∏ 1≤i≤j≤m (1 + tℓxiyj)."
+        page = PageMarkdown(
+            page=4,
+            text=(
+                "Theorem 1.3. The generating polynomial of the k-tilings is "
+                "Here t follows the number of coupled dominos."
+            ),
+            metadata={
+                "native_pdf_text": f"Theorem 1.3\n{formula}",
+                "native_pdf_layout": {
+                    "frame": "page-normalized",
+                    "base_size_pt": 10.0,
+                    "spans": [[0.42, 0.31, 0.43, 0.32, 0.7, True, "2"]],
+                    "truncated": False,
+                },
+            },
+        )
+        chunk = TextChunk(
+            index=0, text=page.text, token_estimate=20, page_texts=[page]
+        )
+        fact = Fact(
+            concept="Theorem 1.3",
+            statement=f"生成多项式为 {formula}",
+            kind="formula",
+            source_quote=formula,
+            page=4,
+            confidence=0.95,
+        )
+
+        selected = _formula_native_text_for_chunk(chunk)
+        grounded = _apply_grounding(
+            ChunkExtraction(summary="定理公式", facts=[fact], new_concepts=[]),
+            page.text,
+            [page],
+        ).facts[0]
+
+        self.assertEqual([4], [item["page"] for item in selected])
+        self.assertEqual(4, _native_pdf_page_for_quote(formula, [page]))
+        self.assertTrue(grounded.grounded)
+        self.assertEqual("pdf_text_layer", grounded.source_origin)
+        self.assertEqual(0.75, grounded.confidence)
+
+    def test_hyphenated_math_paper_term_is_not_treated_as_an_equation(self):
+        fact = Fact(
+            concept="k-tilings",
+            statement="前节的模型扩展到 k-tilings。",
+            kind="method",
+            source_quote="The models extend to k-tilings.",
+            page=2,
+            confidence=0.9,
+        )
+        page = PageMarkdown(page=2, text="The models extend to k-tilings.")
+
+        result = _apply_grounding(
+            ChunkExtraction(summary="", facts=[fact], new_concepts=[]),
+            page.text,
+            [page],
+        ).facts[0]
+
+        self.assertTrue(result.grounded)
+
+    def test_flattened_native_fraction_cannot_ground_a_rewritten_square(self):
+        quote = "(k / 2)(m+1 / 2)-j"
+        fact = Fact(
+            concept="Lemma 6.1",
+            statement="配对数为 (k choose 2)(m^2+1)-j。",
+            kind="result",
+            source_quote=quote,
+            page=33,
+            confidence=0.9,
+        )
+        page = PageMarkdown(
+            page=33,
+            text="Lemma 6.1 with j pairs of coupled dominos.",
+            metadata={
+                "native_pdf_text": quote,
+                "native_pdf_layout": {
+                    "frame": "page-normalized",
+                    "base_size_pt": 10.0,
+                    "spans": [[0.5, 0.4, 0.51, 0.41, 0.7, True, "m"]],
+                    "truncated": True,
+                },
+            },
+        )
+
+        result = _apply_grounding(
+            ChunkExtraction(summary="", facts=[fact], new_concepts=[]),
+            page.text,
+            [page],
+        ).facts[0]
+
+        self.assertFalse(result.grounded)
+        self.assertEqual(0.5, result.confidence)
+
+    def test_partial_formula_quote_cannot_ground_conflicting_native_formula(self):
+        fact = Fact(
+            concept="Theorem A",
+            statement="x^2 - y^2 = 1",
+            kind="formula",
+            source_quote="x^2",
+            page=4,
+            confidence=0.95,
+        )
+        page = PageMarkdown(
+            page=4,
+            text="Theorem A formula is not readable here.",
+            metadata={"native_pdf_text": "Theorem A: x^2 + y^2 = 1"},
+        )
+
+        result = _apply_grounding(
+            ChunkExtraction(summary="", facts=[fact], new_concepts=[]),
+            page.text,
+            [page],
+        ).facts[0]
+
+        self.assertFalse(result.grounded)
+        self.assertEqual("text", result.source_origin)
+        self.assertEqual(0.5, result.confidence)
+
+    def test_aztec_formula_quote_matches_source_but_linearized_operator_order_differs(self):
+        cases = (
+            (
+                "The number of domino tilings of the Aztec diamond of rank m is 2(m+1"
+                + chr(10) + "2 ).",
+                "秩 m 的铺砌数为 2^((m+1) choose 2)。",
+            ),
+            (
+                "k−1" + chr(10) + "∏" + chr(10) + "ℓ=0" + chr(10)
+                + "∏" + chr(10) + "1≤i≤j≤m" + chr(10) + "(1 + tℓxiyj).",
+                "生成多项式为 ∏_{ℓ=0}^{k−1} ∏_{1≤i≤j≤m}(1+t^ℓ x_i y_j)。",
+            ),
+        )
+        for quote, statement in cases:
+            with self.subTest(statement=statement):
+                fact = Fact(
+                    concept="Aztec formula",
+                    statement=statement,
+                    kind="formula",
+                    source_quote=quote,
+                    confidence=0.9,
+                )
+                self.assertTrue(_formula_quote_is_grounded(quote, quote))
+                self.assertFalse(_formula_quote_supports_statement(fact))
+
+    def test_formula_quote_grounding_is_separate_from_structure_verification(self):
+        quote = (
+            "k−1" + chr(10) + "∏" + chr(10) + "ℓ=0" + chr(10)
+            + "∏" + chr(10) + "1≤i≤j≤m" + chr(10) + "(1 + tℓxiyj)."
+        )
+        fact = Fact(
+            concept="Theorem 1.3",
+            statement="生成多项式为 ∏_{ℓ=0}^{k−1} ∏_{1≤i≤j≤m}(1+t^ℓ x_i y_j)。",
+            kind="formula",
+            source_quote=quote,
+            page=4,
+            confidence=0.9,
+        )
+        page = PageMarkdown(
+            page=4,
+            text="Theorem 1.3 formula stub.",
+            metadata={
+                "native_pdf_text": quote,
+                "native_pdf_layout": {
+                    "frame": "page-normalized",
+                    "base_size_pt": 10.0,
+                    "spans": [[0.4, 0.3, 0.42, 0.31, 0.7, True, "ℓ"]],
+                    "truncated": False,
+                },
+            },
+        )
+        extraction = _apply_grounding(
+            ChunkExtraction(summary="formula", facts=[fact], new_concepts=[]),
+            page.text,
+            [page],
+        )
+
+        self.assertTrue(fact._quote_grounded)
+        self.assertEqual("pdf_text_layer", fact._quote_origin)
+        self.assertIsNone(fact._formula_structure_verified)
+        self.assertFalse(fact._formula_operator_signature_match)
+        self.assertFalse(fact.grounded)
+        self.assertEqual("text", fact.source_origin)
+        dumped = _extraction_dump_with_formula_validation(extraction)
+        self.assertEqual(
+            {
+                "quote_grounded": True,
+                "quote_origin": "pdf_text_layer",
+                "operator_signature_match": False,
+                "formula_structure_verified": None,
+                "reason": "linearized_order_mismatch_unverified",
+            },
+            dumped["facts"][0]["formula_validation"],
+        )
+        schema = json.dumps(ChunkExtraction.model_json_schema(), ensure_ascii=False)
+        self.assertNotIn("formula_validation", schema)
+        self.assertNotIn("_quote_grounded", schema)
+
+    def test_exact_linear_formula_tokens_can_verify_structure(self):
+        quote = "x^2 + y^2 = 1"
+        fact = Fact(
+            concept="circle equation",
+            statement="圆满足 x^2+y^2=1。",
+            kind="formula",
+            source_quote=quote,
+            page=1,
+            confidence=0.9,
+        )
+
+        result = _apply_grounding(
+            ChunkExtraction(summary="equation", facts=[fact], new_concepts=[]),
+            quote,
+        ).facts[0]
+
+        self.assertTrue(_formula_structure_status(fact))
+        self.assertTrue(result._formula_operator_signature_match)
+        self.assertTrue(result._formula_structure_verified)
+        self.assertTrue(result.grounded)
+
+    def test_native_pdf_formula_grounding_does_not_ignore_operator_changes(self):
+
+        page = PageMarkdown(
+            page=4,
+            text="Theorem 1.3 formula stub.",
+            metadata={"native_pdf_text": "x^2 + y^2 = 1"},
+        )
+
+        self.assertIsNone(_native_pdf_page_for_quote("x^2 - y^2 = 1", [page]))
+
+    def test_picture_ocr_grounding_preserves_math_operators(self):
+        self.assertTrue(_formula_quote_is_grounded(
+            "x^2 + y^2 = 1", "x ² + y ² = 1"
+        ))
+        self.assertFalse(_formula_quote_is_grounded(
+            "x^2 - y^2 = 1", "x ² + y ² = 1"
+        ))
+
+    def test_formula_lead_in_without_body_is_flagged(self):
+        fact = Fact(
+            concept="Theorem 1.3",
+            statement="生成多项式由定理1.3给出。",
+            kind="formula",
+            source_quote=(
+                "The generating polynomial of the k-tilings is Here t follows "
+                "the number of coupled dominos, and xi and yj follow the numbers."
+            ),
+            page=4,
+            confidence=0.9,
+        )
+
+        normalized = _flag_formula_stub(fact)
+
+        self.assertEqual("result", normalized.kind)
+        self.assertEqual(0.5, normalized.confidence)
+        self.assertIn("未包含公式本体", normalized.statement)
+        self.assertIn("核对原 PDF 页面", normalized.statement)
+
+    def test_readable_formula_body_keeps_formula_kind(self):
+        fact = Fact(
+            concept="Theorem A",
+            statement="圆满足 x^2 + y^2 = 1。",
+            kind="formula",
+            source_quote="The arctic curve is given by x^2 + y^2 = 1.",
+            page=1,
+            confidence=0.9,
+        )
+
+        normalized = _flag_formula_stub(fact)
+
+        self.assertEqual("formula", normalized.kind)
+        self.assertEqual(fact.statement, normalized.statement)
+    def test_rank_two_witness_flags_incompatible_theorem_count(self):
+        fact = Fact(
+            concept="Theorem 1.1",
+            statement="秩m的Aztec diamond铺砌数为2^(m^2+1)。",
+            kind="formula",
+            source_quote="The number of domino tilings ... is 2^(m^2+1).",
+            page=1,
+            confidence=0.95,
+        )
+        source = (
+            "The 8 domino tilings of the Aztec diamond of rank 2 are displayed in Figure 2."
+        )
+
+        flagged = _flag_aztec_rank_count_conflict(fact, source)
+
+        self.assertEqual("result", flagged.kind)
+        self.assertEqual(0.3, flagged.confidence)
+        self.assertIn("32", flagged.statement)
+        self.assertIn("8 种铺砌矛盾", flagged.statement)
+
+    def test_corrected_count_formula_is_not_flagged(self):
+        fact = Fact(
+            concept="Theorem 1.1",
+            statement="秩m的Aztec diamond铺砌数为2^{m(m+1)/2}。",
+            kind="formula",
+            source_quote="The number of domino tilings is 2<sup>m(m+1)/2</sup>.",
+            page=1,
+            confidence=0.95,
+        )
+        source = "The 8 domino tilings of the Aztec diamond of rank 2 are displayed."
+
+        unchanged = _flag_aztec_rank_count_conflict(fact, source)
+
+        self.assertEqual("formula", unchanged.kind)
+        self.assertEqual(fact.statement, unchanged.statement)
 
 
 class HeadingTreeTests(unittest.TestCase):
@@ -387,6 +1047,38 @@ class HeadingTreeTests(unittest.TestCase):
         self.assertEqual([(item.page, item.text) for item in section.page_texts], [(7, "第一页结果"), (8, "第二页结果为 99.37%。")])
         self.assertTrue(result.facts[0].grounded)
         self.assertEqual(result.facts[0].page, 8)
+
+    def test_heading_tree_preserves_formula_sidecar_through_chunking(self):
+        formula = "x^2 + y^2 = 1"
+        layout = {
+            "frame": "page-normalized",
+            "base_size_pt": 10.0,
+            "spans": [[0.4, 0.2, 0.41, 0.21, 0.7, True, "2"]],
+            "truncated": False,
+        }
+        page = PageMarkdown(
+            page=4,
+            text=(
+                "# 1 Introduction\n"
+                "Theorem 1.3. The generating polynomial is Here t follows."
+            ),
+            metadata={
+                "native_pdf_text": f"Theorem 1.3 {formula}",
+                "native_pdf_layout": layout,
+            },
+        )
+        section = flatten_sections(build_heading_tree([page]))[0]
+        chunks = split_text(
+            section.text,
+            max_tokens=1000,
+            overlap_tokens=0,
+            page_texts=section.page_texts,
+        )
+
+        self.assertEqual(formula, chunks[0].page_texts[0].metadata["native_pdf_text"].split("Theorem 1.3 ", 1)[1])
+        selected = _formula_native_text_for_chunk(chunks[0])
+        self.assertEqual([4], [item["page"] for item in selected])
+        self.assertEqual(layout, selected[0]["layout"])
 
     def test_rejects_formula_table_and_sentence_lines_as_headings(self):
         pages = [
@@ -1619,6 +2311,28 @@ class UtilityTests(unittest.TestCase):
         self.assertTrue({"fact-58", "fact-59"} <= allowed)
         self.assertGreater(len(payload["fact_catalog"]), 0)
 
+    def test_document_request_preserves_picture_ocr_origin(self):
+        groups = [GroupSynthesis(
+            summary="公式摘要",
+            concepts=[], findings=[], numeric_claims=[], limitations=[],
+            future_work=[], contradictions=[],
+            source_fact_ids=["fact-ocr"], source_sections=[], source_pages=[],
+        )]
+        catalog = [{
+            "fact_id": "fact-ocr",
+            "concept": "定理公式",
+            "statement": "x^2 + y^2 = 1。",
+            "kind": "formula",
+            "source_origin": "picture_ocr",
+        }]
+
+        payload, allowed = build_document_request(
+            groups, catalog, [], [], max_tokens=700
+        )
+
+        self.assertIn("fact-ocr", allowed)
+        self.assertEqual("picture_ocr", payload["fact_catalog"][0]["source_origin"])
+
     def test_question_request_retrieves_relevant_fact_kinds_within_budget(self):
         facts = [
             {"fact_id": "fact-dataset", "statement": "使用UrbanSound8K数据集", "kind": "dataset"},
@@ -1662,6 +2376,96 @@ class UtilityTests(unittest.TestCase):
 
         self.assertEqual(payload["fact_catalog"][0]["fact_id"], "fact-current")
         self.assertNotIn("fact-related", {fact["fact_id"] for fact in payload["fact_catalog"]})
+
+    def test_quantitative_question_retrieves_generating_polynomial_without_displacing_results(self):
+        facts = [
+            {
+                "fact_id": "fact-result",
+                "concept": "数值结果",
+                "statement": "实验结果达到 91.4%。",
+                "kind": "result",
+                "section_title": "7 Results",
+                "confidence": 0.9,
+            },
+            {
+                "fact_id": "fact-polynomial",
+                "concept": "generating polynomial",
+                "statement": "k-平铺的生成多项式由定理 1.3 给出。",
+                "kind": "formula",
+                "section_title": "1 Introduction",
+                "confidence": 0.95,
+            },
+            {
+                "fact_id": "fact-vertex-weight",
+                "concept": "顶点权重",
+                "statement": "某顶点权重为 xyt。",
+                "kind": "formula",
+                "section_title": "3 Methods",
+                "confidence": 0.9,
+            },
+        ]
+
+        payload, allowed = build_question_request(
+            "最重要的定量结果是什么？", facts, [], max_tokens=1000
+        )
+        selected = {fact["fact_id"] for fact in payload["fact_catalog"]}
+
+        self.assertIn("fact-polynomial", allowed)
+        self.assertIn("fact-polynomial", selected)
+        self.assertEqual(payload["fact_catalog"][0]["fact_id"], "fact-result")
+
+    def test_quantitative_question_prefers_main_text_formula_over_appendix_formula(self):
+        facts = [
+            {
+                "fact_id": "fact-appendix-formula",
+                "concept": "generating polynomial explicit product",
+                "statement": "Appendix A gives the generating polynomial product formula for k-tilings.",
+                "kind": "formula",
+                "section_title": "Appendix A: Proof details",
+                "confidence": 1.0,
+            },
+            {
+                "fact_id": "fact-main-result",
+                "concept": "main quantitative result",
+                "statement": "The main theorem establishes the central tiling result.",
+                "kind": "result",
+                "section_title": "Abstract",
+                "confidence": 0.9,
+            },
+            {
+                "fact_id": "fact-main-formula",
+                "concept": "generating polynomial",
+                "statement": "The paper's generating polynomial is stated in Theorem 1.3.",
+                "kind": "formula",
+                "section_title": "1 Introduction",
+                "confidence": 0.9,
+            },
+        ]
+
+        payload, _ = build_question_request(
+            "最重要的定量结果是什么？", facts, [], max_tokens=1000
+        )
+        ordered_ids = [fact["fact_id"] for fact in payload["fact_catalog"]]
+
+        self.assertEqual(ordered_ids[0], "fact-main-result")
+        self.assertLess(ordered_ids.index("fact-main-formula"), ordered_ids.index("fact-appendix-formula"))
+
+    def test_quantitative_question_keeps_appendix_formula_when_it_is_the_only_match(self):
+        appendix_formula = {
+            "fact_id": "fact-appendix-only",
+            "concept": "generating polynomial",
+            "statement": "The generating polynomial is given in Appendix A.",
+            "kind": "formula",
+            "section_title": "Appendix A",
+            "confidence": 0.9,
+        }
+
+        payload, allowed = build_question_request(
+            "最重要的定量结果是什么？", [appendix_formula], [], max_tokens=600
+        )
+
+        self.assertIn("fact-appendix-only", allowed)
+        self.assertEqual(payload["fact_catalog"][0]["fact_id"], "fact-appendix-only")
 
     def test_metric_question_skips_config_table_rows(self):
         # A config/parameter table row (generic "Value" column, kind="metric")
@@ -1859,6 +2663,138 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual(result.answer, "环境声音随机且难以分类。")
         self.assertEqual(result.source_fact_ids, ["fact-limit"])
         self.assertEqual(result.confidence, 0.8)
+
+    def test_global_answer_confidence_normalizes_common_model_labels(self):
+        base = {
+            "question": "Q",
+            "answer": "A",
+            "source_sections": [],
+            "source_pages": [],
+        }
+        cases = {
+            "high": 0.85,
+            "medium": 0.6,
+            "low": 0.3,
+            "高": 0.85,
+            "中": 0.6,
+            "低": 0.3,
+            "0.72": 0.72,
+            "72%": 0.72,
+            "unknown": 0.0,
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                answer = GlobalAnswer.model_validate({**base, "confidence": raw})
+                self.assertAlmostEqual(answer.confidence, expected)
+
+    def test_answer_does_not_replace_insufficient_with_unselected_candidate(self):
+        answer = GlobalAnswer(
+            question="使用了哪些评价指标？",
+            answer="证据不足",
+            source_fact_ids=[],
+            source_sections=[],
+            source_pages=[],
+            confidence=0.0,
+        )
+        candidate = {
+            "fact_id": "fact-unrelated",
+            "statement": "菱形平铺由若干单位菱形组成。",
+            "kind": "definition",
+            "section_title": "背景",
+        }
+        fact = {
+            **candidate,
+            "source_quote": "菱形平铺由若干单位菱形组成。",
+            "section_id": "s1",
+            "page": 2,
+            "confidence": 0.9,
+            "grounded": True,
+        }
+
+        result = _finalize_answer_provenance(
+            answer, [candidate], {"fact-unrelated": fact}, {"fact-unrelated"}
+        )
+
+        self.assertEqual(result.answer, "证据不足")
+        self.assertEqual(result.source_fact_ids, [])
+        self.assertEqual(result.evidence_chain, [])
+
+    def test_chain_is_cleared_when_provenance_audit_downgrades_answer(self):
+        answer = GlobalAnswer(
+            question="文档使用了哪些数据集？",
+            answer="本文使用了多个数据集。",
+            source_fact_ids=[],
+            evidence_chain=[
+                {
+                    "step_index": 1,
+                    "claim": "本文使用了多个数据集。",
+                    "source_fact_ids": [],
+                    "relation_to_previous": "none",
+                }
+            ],
+            source_sections=[],
+            source_pages=[],
+            confidence=0.8,
+        )
+
+        result = _finalize_answer_provenance(answer, [], {}, set())
+
+        self.assertEqual(result.answer, "证据不足")
+        self.assertEqual(result.evidence_chain, [])
+        self.assertEqual(result.source_fact_ids, [])
+        self.assertEqual(result.source_sections, [])
+        self.assertEqual(result.source_pages, [])
+        self.assertEqual(result.confidence, 0.0)
+
+    def test_evidence_chain_validates_pointers_and_marks_relation_unverified(self):
+        answer = GlobalAnswer(
+            question="方法如何减少误差？",
+            answer="方法A减少误差。",
+            source_fact_ids=[],
+            evidence_chain=[
+                {
+                    "step_index": 4,
+                    "claim": "方法A减少误差。",
+                    "source_fact_ids": [],
+                    "relation_to_previous": "supports",
+                },
+                {
+                    "step_index": 8,
+                    "claim": "这来自越权事实。",
+                    "source_fact_ids": ["fact-forged"],
+                    "relation_to_previous": "combines",
+                },
+            ],
+            source_sections=[],
+            source_pages=[],
+            confidence=0.9,
+        )
+        fact = {
+            "fact_id": "fact-valid",
+            "statement": "方法A减少误差。",
+            "source_quote": "原文指出方法A减少误差。",
+            "section_id": "section-1",
+            "section_title": "方法",
+            "page": 12,
+            "confidence": 0.9,
+            "grounded": True,
+        }
+
+        result = _finalize_answer_provenance(
+            answer, [fact], {"fact-valid": fact}, {"fact-valid"}
+        )
+
+        self.assertEqual(result.source_fact_ids, ["fact-valid"])
+        self.assertEqual(result.evidence_chain[0].step_index, 1)
+        self.assertEqual(result.evidence_chain[0].relation_to_previous, "none")
+        self.assertEqual(result.evidence_chain[0].source_fact_ids, ["fact-valid"])
+        self.assertEqual(result.evidence_chain[0].source_resolution, "heuristic_recovery")
+        self.assertEqual(result.evidence_chain[0].source_pointer_status, "validated")
+        self.assertEqual(result.evidence_chain[0].claim_support_status, "heuristic_supported")
+        self.assertEqual(result.evidence_chain[1].source_fact_ids, [])
+        self.assertEqual(result.evidence_chain[1].source_pointer_status, "invalid")
+        self.assertEqual(result.evidence_chain_status, "partial_or_invalid_pointers")
+        self.assertEqual(result.relation_validation, "not_performed")
 
     def test_section_evidence_only_contains_grounded_facts(self):
         result = {
@@ -2635,6 +3571,8 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual(result.source_sections, ["s1"])
         self.assertEqual(result.source_pages, [3])
         self.assertEqual(result.confidence, 0.8)
+        self.assertEqual(result.evidence_chain, [])
+        self.assertEqual(result.evidence_chain_status, "deterministic_short_circuit")
 
     def test_build_contradiction_answer_unmatched_keeps_answer_with_0_5_confidence(self):
         contradictions = [{"statement": "某处声称X但另一处声称Y。", "source_fact_ids": []}]
@@ -2708,6 +3646,68 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual(answer.source_fact_ids, ["f1"])
         self.assertEqual(answer.source_sections, ["s1"])
         self.assertEqual(answer.confidence, 0.8)
+
+    def test_global_answer_passes_configured_reasoning_effort(self):
+        cache_keys = []
+        for effort in ("low", "none"):
+            with self.subTest(effort=effort):
+                pipeline = LongDocumentPipeline.__new__(LongDocumentPipeline)
+                pipeline.flash_model = "fake-model"
+                pipeline.global_answer_reasoning_effort = effort
+                pipeline.document_max_output_tokens = 3000
+                pipeline._document_fact_index = {}
+                pipeline.cache = SimpleNamespace(
+                    get=lambda key: cache_keys.append(key) or None,
+                    put=lambda *_args: None,
+                )
+                observed = {}
+
+                async def fake_request_json(*_args, **kwargs):
+                    observed["reasoning_effort"] = kwargs["reasoning_effort"]
+                    observed["system"] = _args[2]
+                    return {
+                        "question": "研究问题是什么？",
+                        "answer": "证据不足",
+                        "source_fact_ids": [],
+                        "source_sections": [],
+                        "source_pages": [],
+                        "confidence": 0.0,
+                    }
+
+                pipeline._request_json = fake_request_json
+                asyncio.run(
+                    pipeline._answer_global_question("研究问题是什么？", [], [])
+                )
+                self.assertEqual(observed["reasoning_effort"], effort)
+                self.assertIn("evidence_chain", observed["system"])
+                self.assertIn("confidence 必须是 0 到 1 之间的数字", observed["system"])
+                self.assertIn("占位字符串", observed["system"])
+                self.assertNotIn('"fact-id"', observed["system"])
+                self.assertIn("关系标签是模型提出", observed["system"])
+        self.assertEqual(len(cache_keys), 2)
+        self.assertNotEqual(cache_keys[0], cache_keys[1])
+
+    def test_legacy_global_answer_cache_is_accepted_without_fabricating_chain(self):
+        pipeline = LongDocumentPipeline.__new__(LongDocumentPipeline)
+        pipeline.flash_model = "fake-model"
+        pipeline.global_answer_reasoning_effort = "low"
+        pipeline._document_fact_index = {}
+        cached = {
+            "question": "研究问题是什么？",
+            "answer": "证据不足",
+            "source_fact_ids": [],
+            "source_sections": [],
+            "source_pages": [],
+            "confidence": 0.0,
+        }
+        pipeline.cache = SimpleNamespace(get=lambda _key: cached)
+
+        answer = asyncio.run(
+            pipeline._answer_global_question("研究问题是什么？", [], [])
+        )
+
+        self.assertEqual(answer.evidence_chain, [])
+        self.assertEqual(answer.evidence_chain_status, "unavailable_legacy")
 
     def test_finalize_provenance_number_gate_replaces_fabricated_clause_answer(self):
         answer = GlobalAnswer(
@@ -3679,22 +4679,20 @@ class RequestRetryTests(unittest.IsolatedAsyncioTestCase):
         await self._cleanup_usage(pipeline)
 
     async def test_extract_chunk_initial_call_thinks_off(self):
-        # The first flash extraction call must not burn the output budget on
-        # reasoning: reasoning_effort="none", max_tokens aligned to the pipeline
-        # budget (4096), while all later stages keep their default "low".
+        # The first extraction call should use compact keys and reasoning_effort=none.
         valid = {
-            "summary": "摘要",
-            "facts": [
+            "s": "摘要",
+            "f": [
                 {
-                    "concept": "概念",
-                    "statement": "事实",
-                    "kind": "result",
-                    "source_quote": "原文",
-                    "page": 1,
-                    "confidence": 0.9,
+                    "c": "概念",
+                    "s": "事实",
+                    "k": "result",
+                    "q": "原文",
+                    "p": 1,
+                    "cf": 0.9,
                 }
             ],
-            "new_concepts": [],
+            "nc": [],
         }
         pipeline, completions = await self._make_extract_pipeline(
             [("stop", json.dumps(valid, ensure_ascii=False))]
@@ -3708,12 +4706,222 @@ class RequestRetryTests(unittest.IsolatedAsyncioTestCase):
         result = await pipeline.extract_chunk(section, chunk)
 
         self.assertEqual(len(result.facts), 1)
+        self.assertEqual(result.summary, "摘要")
+        self.assertEqual(result.new_concepts, [])
+        self.assertEqual(result.facts[0].concept, "概念")
+        self.assertEqual(result.facts[0].statement, "事实")
+        self.assertEqual(result.facts[0].source_quote, "原文")
+        self.assertEqual(result.facts[0].confidence, 0.9)
         self.assertEqual(completions.calls, 1)
         first = completions.kwargs[0]
         self.assertEqual(first["reasoning_effort"], "none")
         self.assertEqual(first["max_tokens"], pipeline.extract_max_output_tokens)
-        # result is written to cache so a second call would hit (prompt unchanged)
         self.assertEqual(pipeline.cache.summary()["misses"], 1)
+        await self._cleanup_extract(pipeline)
+
+    async def test_extract_chunk_drops_imperative_recall_mislabeled_as_metric(self):
+        invalid = {
+            "summary": "回顾 L 矩阵代数定义。",
+            "facts": [{
+                "concept": "Recall",
+                "statement": "原文使用了评价指标 Recall。",
+                "kind": "metric",
+                "source_quote": "Recall the algebraic definition of the L matrix",
+                "page": 45,
+                "confidence": 0.9,
+            }],
+            "new_concepts": [],
+        }
+        pipeline, _ = await self._make_extract_pipeline(
+            [("stop", json.dumps(invalid, ensure_ascii=False))]
+        )
+        section = HeadingNode(
+            id="s-recall", title="Appendix B", level=2,
+            page_start=45, page_end=45, subtree_page_end=45,
+        )
+        chunk = TextChunk(
+            index=0,
+            text="Recall the algebraic definition of the L matrix",
+            token_estimate=10,
+        )
+
+        result = await pipeline.extract_chunk(section, chunk)
+
+        self.assertEqual([], result.facts)
+        await self._cleanup_extract(pipeline)
+
+    async def test_extract_chunk_uses_formula_page_picture_ocr_sidecar(self):
+        response = {
+            "summary": "定理公式。",
+            "facts": [{
+                "concept": "Theorem A",
+                "statement": "x^2 + y^2 = 1。",
+                "kind": "formula",
+                "source_quote": "x^2 + y^2 = 1",
+                "page": 4,
+                "confidence": 0.95,
+            }],
+            "new_concepts": [],
+        }
+        pipeline, completions = await self._make_extract_pipeline(
+            [("stop", json.dumps(response, ensure_ascii=False))]
+        )
+        section = HeadingNode(
+            id="s-ocr-formula", title="Theorem A", level=2,
+            page_start=4, page_end=4, subtree_page_end=4,
+        )
+        chunk = TextChunk(
+            index=0,
+            text="Theorem A. The formula is given by",
+            token_estimate=10,
+            page_texts=[PageMarkdown(
+                page=4,
+                text="Theorem A. The formula is given by",
+                metadata={"picture_ocr_text": "x^2 + y^2 = 1"},
+            )],
+        )
+
+        result = await pipeline.extract_chunk(section, chunk)
+
+        self.assertEqual(1, len(result.facts))
+        self.assertTrue(result.facts[0].grounded)
+        self.assertEqual("picture_ocr", result.facts[0].source_origin)
+        self.assertEqual(0.65, result.facts[0].confidence)
+        user_payload = json.loads(completions.kwargs[0]["messages"][1]["content"])
+        self.assertEqual([{"page": 4, "text": "x^2 + y^2 = 1"}], user_payload["picture_ocr"])
+        self.assertIn("OCR 辅助文本", completions.kwargs[0]["messages"][0]["content"])
+        await self._cleanup_extract(pipeline)
+
+    async def test_extract_chunk_sends_native_formula_page_text(self):
+        formula = "k−1 ∏ ℓ=0 ∏ 1≤i≤j≤m (1 + tℓxiyj)."
+        response = {
+            "summary": "定理公式。",
+            "facts": [{
+                "concept": "Theorem 1.3",
+                "statement": f"生成多项式为 {formula}",
+                "kind": "formula",
+                "source_quote": formula,
+                "page": 4,
+                "confidence": 0.95,
+            }],
+            "new_concepts": [],
+        }
+        pipeline, completions = await self._make_extract_pipeline(
+            [("stop", json.dumps(response, ensure_ascii=False))]
+        )
+        page = PageMarkdown(
+            page=4,
+            text=(
+                "Theorem 1.3. The generating polynomial of the k-tilings is "
+                "Here t follows the number of coupled dominos."
+            ),
+            metadata={
+                "native_pdf_text": f"Theorem 1.3\n{formula}",
+                "native_pdf_layout": {
+                    "frame": "page-normalized",
+                    "base_size_pt": 10.0,
+                    "spans": [[0.42, 0.31, 0.43, 0.32, 0.7, True, "2"]],
+                    "truncated": False,
+                },
+            },
+        )
+        section = HeadingNode(
+            id="s-native-formula", title="Theorem 1.3", level=2,
+            page_start=4, page_end=4, subtree_page_end=4,
+        )
+        chunk = TextChunk(
+            index=0, text=page.text, token_estimate=20, page_texts=[page]
+        )
+
+        result = await pipeline.extract_chunk(section, chunk)
+
+        self.assertEqual("pdf_text_layer", result.facts[0].source_origin)
+        self.assertTrue(result.facts[0].grounded)
+        user_payload = json.loads(completions.kwargs[0]["messages"][1]["content"])
+        self.assertEqual(4, user_payload["native_pdf_text"][0]["page"])
+        self.assertIn(formula, user_payload["native_pdf_text"][0]["text"])
+        self.assertEqual(
+            "page-normalized",
+            user_payload["native_pdf_text"][0]["layout"]["frame"],
+        )
+        system_prompt = completions.kwargs[0]["messages"][0]["content"]
+        self.assertIn("size_ratio", system_prompt)
+        self.assertIn("layout.truncated", system_prompt)
+        await self._cleanup_extract(pipeline)
+
+    async def test_extract_chunk_flags_theorem_formula_stub(self):
+        response = {
+            "summary": "定理给出生成多项式。",
+            "facts": [{
+                "concept": "Theorem 1.3",
+                "statement": "生成多项式由定理1.3给出。",
+                "kind": "formula",
+                "source_quote": (
+                    "The generating polynomial of the k-tilings is Here t follows "
+                    "the number of coupled dominos."
+                ),
+                "page": 4,
+                "confidence": 0.9,
+            }],
+            "new_concepts": [],
+        }
+        pipeline, _ = await self._make_extract_pipeline(
+            [("stop", json.dumps(response, ensure_ascii=False))]
+        )
+        section = HeadingNode(
+            id="s-formula", title="Introduction", level=1,
+            page_start=4, page_end=4, subtree_page_end=4,
+        )
+        chunk = TextChunk(
+            index=0,
+            text=(
+                "The generating polynomial of the k-tilings is Here t follows "
+                "the number of coupled dominos."
+            ),
+            token_estimate=20,
+        )
+
+        result = await pipeline.extract_chunk(section, chunk)
+
+        self.assertEqual(1, len(result.facts))
+        self.assertEqual("result", result.facts[0].kind)
+        self.assertIn("未包含公式本体", result.facts[0].statement)
+        await self._cleanup_extract(pipeline)
+
+    async def test_extract_chunk_flags_rank_two_count_conflict(self):
+        source = (
+            "The number of domino tilings of the Aztec diamond of rank m is "
+            "2^(m^2+1). The 8 domino tilings of the Aztec diamond of rank 2 "
+            "are displayed in Figure 2."
+        )
+        response = {
+            "summary": "秩m的铺砌数公式。",
+            "facts": [{
+                "concept": "Theorem 1.1",
+                "statement": "秩m的Aztec diamond铺砌数为2^(m^2+1)。",
+                "kind": "formula",
+                "source_quote": (
+                    "The number of domino tilings of the Aztec diamond of rank m is "
+                    "2^(m^2+1)."
+                ),
+                "page": 1,
+                "confidence": 0.95,
+            }],
+            "new_concepts": [],
+        }
+        pipeline, _ = await self._make_extract_pipeline(
+            [("stop", json.dumps(response, ensure_ascii=False))]
+        )
+        section = HeadingNode(
+            id="s-count", title="Introduction", level=1,
+            page_start=1, page_end=1, subtree_page_end=1,
+        )
+        chunk = TextChunk(index=0, text=source, token_estimate=30)
+
+        result = await pipeline.extract_chunk(section, chunk)
+
+        self.assertEqual("result", result.facts[0].kind)
+        self.assertIn("32", result.facts[0].statement)
         await self._cleanup_extract(pipeline)
 
     async def test_extract_chunk_prompt_caps_output(self):
@@ -3736,8 +4944,14 @@ class RequestRetryTests(unittest.IsolatedAsyncioTestCase):
         await pipeline.extract_chunk(section, chunk)
 
         system_prompt = completions.kwargs[0]["messages"][0]["content"]
-        self.assertIn("最多输出 20 条", system_prompt)
-        self.assertIn("source_quote 尽量简短", system_prompt)
+        self.assertIn('"f":[{"c":"概念","s":"事实"', system_prompt)
+        self.assertIn("顶层 s=summary、f=facts、nc=new_concepts", system_prompt)
+        self.assertIn("source_quote 必须是足以支持 statement 的最短连续原文片段", system_prompt)
+        self.assertIn("非公式引用最多 80 个字符", system_prompt)
+        self.assertIn("允许 q 超过 80 字以保留完整公式和紧邻条件", system_prompt)
+        self.assertIn("statement 必须包含完整数学表达式", system_prompt)
+        self.assertIn("不得凭数学常识补公式", system_prompt)
+        self.assertEqual(EXTRACTION_PROMPT_VERSION, "v2.21")
         await self._cleanup_extract(pipeline)
 
     async def test_extract_chunk_prompt_requests_prose_metrics(self):
@@ -3760,6 +4974,8 @@ class RequestRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("metric", system_prompt)
         self.assertIn("正文叙述", system_prompt)
         self.assertIn("准确率", system_prompt)
+        self.assertIn("句首 “Recall the definition...” 中 Recall 是“回顾”这个动词", system_prompt)
+        self.assertIn("普通动词 “map to/映射到”也不是 mAP 指标", system_prompt)
         await self._cleanup_extract(pipeline)
 
     async def test_process_section_adds_prose_metric_facts(self):
@@ -3935,6 +5151,8 @@ class RequestRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("candidate_title", system)
         self.assertIn("衔接词", system)
         self.assertIn("分点", system)
+        self.assertIn("future_work 只列文档结束时仍未完成", system)
+        self.assertIn("检查后续章节是否已经报告同一工作已完成", system)
         await self._cleanup_reduce(pipeline)
 
     async def test_synthesize_overview_cached_reapplies_backstop(self):
@@ -4071,6 +5289,7 @@ class RequestRetryTests(unittest.IsolatedAsyncioTestCase):
         scripted = [self._group_response(), self._overview_response("AGENT AI:")]
         scripted += [self._answer_response() for _ in range(10)]
         scripted += [self._overview_response("AGENT AI:")]
+        scripted += [self._answer_response() for _ in range(10)]
         pipeline, completions = await self._make_reduce_pipeline(scripted)
         pipeline.document_max_output_tokens = 3000
         pipeline.document_title = full_title
@@ -4090,7 +5309,55 @@ class RequestRetryTests(unittest.IsolatedAsyncioTestCase):
         third = await pipeline.synthesize_document(section_results)
         self.assertEqual(completions.calls, 13)  # +1 fresh overview; reduce + answers still cached
         self.assertEqual(third.title, other_title)
+
+        # A paired reasoning-effort test must not be masked by a cached document
+        # bundle. The overview remains cached, while the 10 effort-specific QA calls
+        # are issued again against the same extracted/grouped evidence.
+        pipeline.global_answer_reasoning_effort = "none"
+        fourth = await pipeline.synthesize_document(section_results)
+        self.assertEqual(completions.calls, 23)
+        self.assertEqual(fourth.title, other_title)
+        self.assertTrue(
+            all(call["reasoning_effort"] == "none" for call in completions.kwargs[13:])
+        )
         await self._cleanup_reduce(pipeline)
+
+
+class ExtractOnlyBenchmarkMetricsTests(unittest.TestCase):
+    def test_reports_grounding_quote_lengths_and_fact_cap_saturation(self):
+        sections = [
+            {
+                "chunks": [{"index": 0}, {"index": 1}],
+                "extractions": [
+                    {
+                        "facts": [
+                            {"grounded": True, "source_quote": "q" * 90},
+                            {"grounded": False, "source_quote": "x" * 10},
+                        ]
+                    },
+                    {
+                        "facts": [
+                            {"grounded": True, "source_quote": "z" * size}
+                            for size in range(1, 21)
+                        ]
+                    },
+                ],
+            }
+        ]
+
+        metrics = _extract_only_metrics(sections)
+
+        self.assertEqual(metrics["chunk_count"], 2)
+        self.assertEqual(metrics["fact_count"], 22)
+        self.assertEqual(metrics["grounded_fact_count"], 21)
+        self.assertEqual(metrics["grounding_rate"], 0.9545)
+        self.assertEqual(metrics["chunks_at_fact_cap_20"], 1)
+        self.assertEqual(metrics["quote_chars_total"], 310)
+        self.assertEqual(metrics["quote_chars_p50"], 11)
+        self.assertEqual(metrics["quote_chars_p90"], 19)
+        self.assertEqual(metrics["quote_chars_max"], 90)
+        self.assertEqual(metrics["quote_over_80_count"], 1)
+        self.assertEqual(metrics["per_chunk_fact_counts"], [2, 20])
 
 
 if __name__ == "__main__":
