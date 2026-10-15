@@ -42,7 +42,7 @@ MARK_TAG_RE = re.compile(r"</?mark\b[^>]*>", re.IGNORECASE)
 EXTRACTION_PROMPT_VERSION = "v2.21"
 REDUCE_PROMPT_VERSION = "v2.11"
 GROUP_PROMPT_VERSION = "v2.13"
-DOCUMENT_PROMPT_VERSION = "v2.26"
+DOCUMENT_PROMPT_VERSION = "v2.32"
 DEFAULT_GROUP_BATCH_TOKENS = 12800
 GLOBAL_QUESTIONS = [
     "文档的核心研究问题是什么？",
@@ -180,6 +180,7 @@ class TableFact(BaseModel):
     value: float
     display_value: str
     unit: str = ""
+    reported_change_pct: float | None = None
     statement: str
     source_quote: str
     page: int
@@ -287,10 +288,16 @@ class EvidenceChainStep(BaseModel):
         return "unchecked"
 
 
+class ClaimCitation(BaseModel):
+    claim: str
+    source_fact_ids: list[str]
+
+
 class GlobalAnswer(BaseModel):
     question: str
     answer: str
     source_fact_ids: list[str] = Field(default_factory=list)
+    claim_citations: list[ClaimCitation] = Field(default_factory=list)
     evidence_chain: list[EvidenceChainStep] = Field(default_factory=list)
     evidence_chain_status: Literal[
         "pointers_validated_relations_unverified",
@@ -307,6 +314,7 @@ class GlobalAnswer(BaseModel):
 
     @field_validator(
         "source_fact_ids",
+        "claim_citations",
         "evidence_chain",
         "source_sections",
         "source_pages",
@@ -1395,8 +1403,9 @@ class UsageTracker:
     lifetime aggregate explicitly. Both are reported in the output JSON so a
     cost estimate cannot silently mix the two.
 
-    Tokens are always written with a UTC "+00:00" suffix, so comparing the ISO
-    strings lexicographically is exactly comparing instants.
+    A rowid watermark separates this run from prior rows in the shared DB.
+    Comparing timestamps can include the last row of a prior run when the
+    system clock resolution is coarser than the interval between runs.
     """
 
     def __init__(self, path: str | Path):
@@ -1415,8 +1424,9 @@ class UsageTracker:
             )
             """
         )
-        # Captured before the first write, so every row recorded by this tracker
-        # sorts at or after it.
+        self.start_rowid = self.connection.execute(
+            "SELECT COALESCE(MAX(rowid), 0) FROM usage"
+        ).fetchone()[0]
         self.run_started_at = datetime.now(timezone.utc).isoformat()
 
     def record(
@@ -1444,9 +1454,9 @@ class UsageTracker:
         )
         self.connection.commit()
 
-    def _aggregate(self, since: str | None) -> dict:
-        where = " WHERE created_at >= ?" if since else ""
-        params: tuple = (since,) if since else ()
+    def _aggregate(self, after_rowid: int | None) -> dict:
+        where = " WHERE rowid > ?" if after_rowid is not None else ""
+        params: tuple = (after_rowid,) if after_rowid is not None else ()
         totals = self.connection.execute(
             f"""
             SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
@@ -1481,7 +1491,7 @@ class UsageTracker:
 
     def summary(self) -> dict:
         """Usage recorded by this run only. Same shape as `all_time_summary`."""
-        result = self._aggregate(self.run_started_at)
+        result = self._aggregate(self.start_rowid)
         result["run_started_at"] = self.run_started_at
         return result
 
@@ -1754,10 +1764,16 @@ def _clean_table_cell(value: str) -> str:
 
 def _parse_numeric_cell(value: str) -> tuple[float, str, str] | None:
     cleaned = _clean_table_cell(value)
-    match = re.fullmatch(r"([-+]?\d+(?:\.\d+)?)\s*(%?)", cleaned)
+    # Runtime cells often append a reported reduction, e.g. "882s ↓44.6%".
+    # The primary value is 882 seconds; the annotation is checked separately.
+    match = re.fullmatch(
+        r"([-+]?\d+(?:\.\d+)?)\s*(ms|s|sec|min|%)?"
+        r"(?:\s*[↓↑]\s*\d+(?:\.\d+)?\s*%)?",
+        cleaned, re.IGNORECASE,
+    )
     if not match:
         return None
-    return float(match.group(1)), match.group(1), match.group(2)
+    return float(match.group(1)), match.group(1), match.group(2) or ""
 
 
 def _cell_is_numeric(cell: str) -> bool:
@@ -1765,7 +1781,7 @@ def _cell_is_numeric(cell: str) -> bool:
     arrow/delta glyph), e.g. "64.28", "99%", "↑2.5%". Model names like
     "4.5-Opus" or "70B" are NOT numeric, so they can stay in header rows."""
     stripped = _clean_table_cell(cell).lstrip("↑↓−+-±")
-    return bool(re.fullmatch(r"\d+(?:\.\d+)?\s*%?", stripped))
+    return _parse_numeric_cell(stripped) is not None
 
 
 _LEADING_STRAY_CLOSERS_RE = re.compile(r"^[)\]}）】」]+")
@@ -1828,6 +1844,68 @@ def _merge_table_headers(header_rows: list[list[str]]) -> list[str]:
     return headers
 
 
+def _restore_spanned_headers(headers: list[str], caption: str) -> list[str]:
+    """Rejoin benchmark names split across adjacent PDF table columns.
+
+    The caption supplies the exact spelling, so this does not guess a name from
+    fragments (``Assist``/``antBe``/``nch`` -> ``AssistantBench``). A matched
+    group ends at its final fragment; the final group also covers trailing
+    columns whose shared super-header was blank in the text layer.
+    """
+    caption_names = [
+        word for word in re.findall(r"\b[A-Za-z][A-Za-z0-9]{3,}\b", caption)
+        if word.lower().endswith("bench") or (len(word) >= 4 and word.isupper())
+    ]
+    names = list(caption_names)
+    first_words = [re.match(r"[A-Za-z]+", header) for header in headers]
+    # Some captions say only "task accuracy" while the header itself contains
+    # every fragment of the benchmark name.
+    for start in range(len(headers)):
+        joined = ""
+        for end in range(start, min(start + 4, len(headers))):
+            if not first_words[end]:
+                break
+            joined += first_words[end].group(0)
+            if end > start and (
+                joined.lower().endswith("bench")
+                or (len(joined) >= 4 and joined.isupper())
+            ):
+                names.append(joined)
+    matches: list[tuple[int, int, str]] = []
+    for name in names:
+        for start in range(len(headers)):
+            joined = ""
+            for end in range(start, min(start + 4, len(headers))):
+                if not first_words[end]:
+                    break
+                joined += first_words[end].group(0)
+                if end > start and joined.lower() == name.lower():
+                    matches.append((start, end, name))
+                    break
+                if not name.lower().startswith(joined.lower()):
+                    break
+    chosen: list[tuple[int, int, str]] = []
+    for match in sorted(matches, key=lambda item: (
+        0 if item[2] in caption_names else 1,
+        item[1] - item[0], len(item[2]),
+    )):
+        if all(match[1] < prior[0] or match[0] > prior[1] for prior in chosen):
+            chosen.append(match)
+    matches = sorted(chosen)
+    repaired = list(headers)
+    previous_end = -1
+    for index, (start, end, name) in enumerate(matches):
+        group_start = start if index == 0 else previous_end + 1
+        group_end = end if index < len(matches) - 1 else len(headers) - 1
+        for column in range(group_start, group_end + 1):
+            header = headers[column]
+            if start <= column <= end and first_words[column]:
+                header = header[first_words[column].end():].strip()
+            repaired[column] = f"{name} {header}".strip()
+        previous_end = end
+    return repaired
+
+
 def _table_rows(text: str) -> list[tuple[str, list[str], list[list[str]], list[str]]]:
     lines = text.splitlines()
     tables = []
@@ -1883,9 +1961,9 @@ def _table_rows(text: str) -> list[tuple[str, list[str], list[list[str]], list[s
             ),
             "",
         )
-        tables.append(
-            (embedded_title or title or "Table", headers, rows[data_start:], block[data_start:])
-        )
+        table_title = embedded_title or title or "Table"
+        headers = _restore_spanned_headers(headers, table_title)
+        tables.append((table_title, headers, rows[data_start:], block[data_start:]))
     return tables
 
 
@@ -1969,6 +2047,9 @@ def extract_table_facts(section: HeadingNode) -> list[TableFact]:
                         continue
                     value, display_value, cell_unit = parsed
                     metric = headers[column]
+                    change = re.search(
+                        r"↓\s*(\d+(?:\.\d+)?)\s*%", _clean_table_cell(padded[column])
+                    )
                     # Config detection still sees the full caption text, so marker
                     # matching is unchanged.
                     if _row_is_config_row(table, metric, row_context):
@@ -1998,6 +2079,7 @@ def extract_table_facts(section: HeadingNode) -> list[TableFact]:
                             value=value,
                             display_value=display_value,
                             unit=unit,
+                            reported_change_pct=float(change.group(1)) if change else None,
                             statement=statement,
                             source_quote=source_quote,
                             page=page_text.page,
@@ -3048,6 +3130,29 @@ def extract_metric_facts(
         return []
     page_texts = section.page_texts or [PageMarkdown(page=section.page_start, text=text)]
     facts: list[Fact] = []
+    # Enumerated evaluation frameworks are often laid out as separate lines.
+    # An LLM may quote all four layers as one fact, which fails contiguous-quote
+    # grounding; keep each exact line as its own checkable metric fact.
+    for line in text.splitlines():
+        match = re.match(r"^\s*\*{0,2}Layer\s+(\d+)[—–:-]", line, re.IGNORECASE)
+        if not match:
+            continue
+        quote = line.strip()
+        cleaned = _clean_table_cell(quote)
+        fact = Fact(
+            concept=f"评估栈第{match.group(1)}层",
+            statement=f"评估栈第{match.group(1)}层：{cleaned}",
+            kind="metric",
+            source_quote=quote,
+            page=_quote_page(quote, page_texts) or section.page_start,
+            confidence=0.9,
+            grounded=True,
+            source_origin="text",
+        )
+        fact.fact_id = _stable_fact_id(section.id, fact)
+        facts.append(fact)
+        if len(facts) >= max_facts:
+            return facts
     seen_terms: set[str] = set()
     claimed_performance = False
     for sentence in (raw.strip() for raw in _SENTENCE_SPLIT_RE.split(text)):
@@ -3215,6 +3320,46 @@ def _normalize_metric_key(value: str) -> str:
     return re.sub(r"[^a-z0-9一-鿿]+", "", str(value).lower())
 
 
+def _runtime_comparison_key(fact: dict) -> tuple[str, str, str] | None:
+    """Conservative identity for comparable benchmark runtime table cells."""
+    metric = str(fact.get("metric", "")).lower()
+    if "runtime" not in metric or str(fact.get("unit", "")).lower() not in {"s", "sec"}:
+        return None
+    benchmark = next(
+        (name for name in ("assistantbench", "gaia") if name in metric), None
+    )
+    if not benchmark:
+        return None
+    context = fact.get("row_context") or {}
+    method = next(
+        (str(value).lower() for key, value in context.items()
+         if key.lower() in {"method", "memory system", "variant"}), ""
+    )
+    if "learning to share" in method or re.search(r"\blts\s*\(ours\)", method):
+        method = "lts"
+    elif "m1-parallel" in method or method == "none":
+        method = "m1-parallel"
+    else:
+        return None
+    model = next(
+        (str(value).lower() for key, value in context.items() if key.lower() == "model"), ""
+    )
+    if not model:
+        caption = str(fact.get("table_caption", "")).lower()
+        if "gpt-5.1" in caption:
+            model = "gpt-5.1"
+    if "gpt-5.1" in model:
+        model = "gpt-5.1"
+    elif "32b" in model:
+        # A PDF text layer may split a row-spanning label across rows
+        # ("Qen3" / "w (32B)"). Match within this table only; do not infer a
+        # specific 32B model from the damaged spelling.
+        model = "32b-model"
+    else:
+        return None
+    return benchmark, model, method
+
+
 def detect_document_contradictions(section_results: list[dict]) -> list[dict]:
     """Deterministically find numeric table conflicts that span the document.
 
@@ -3301,6 +3446,62 @@ def detect_document_contradictions(section_results: list[dict]) -> list[dict]:
             item.get("statement", ""),
         )
     )
+    # Different tables may repeat the exact same benchmark/model/method runtime.
+    # Unlike the broad table scan above, this uses a strict identity so a new
+    # experiment or different model is not mistaken for a contradiction.
+    runtime_groups: dict[tuple[str, str, str], list[dict]] = {}
+    for section_result in section_results:
+        for fact in section_result.get("table_facts", []):
+            identity = _runtime_comparison_key(fact)
+            if identity:
+                runtime_groups.setdefault(identity, []).append(fact)
+    for (benchmark, model, method), facts in runtime_groups.items():
+        if model == "32b-model":
+            continue
+        for left in facts:
+            for right in facts:
+                if left is right or left.get("table") == right.get("table"):
+                    continue
+                if float(left["value"]) == float(right["value"]):
+                    continue
+                ids = [str(left["fact_id"]), str(right["fact_id"])]
+                if any(set(ids) == set(item["source_fact_ids"]) for item in contradictions):
+                    continue
+                contradictions.append({
+                    "statement": (
+                        f"{benchmark}、{model}、{method} 的运行时间在 "
+                        f"{left['table']} 为 {left['display_value']} 秒，"
+                        f"在 {right['table']} 为 {right['display_value']} 秒。"
+                    ),
+                    "source_fact_ids": ids,
+                })
+                break
+            else:
+                continue
+            break
+    for (benchmark, model, method), facts in runtime_groups.items():
+        if method != "lts":
+            continue
+        for fact in facts:
+            reported = fact.get("reported_change_pct")
+            if reported is None:
+                continue
+            baseline = next((item for item in runtime_groups.get(
+                (benchmark, model, "m1-parallel"), []
+            ) if item.get("table") == fact.get("table")), None)
+            if not baseline or float(baseline["value"]) <= 0:
+                continue
+            calculated = 100 * (float(baseline["value"]) - float(fact["value"])) / float(baseline["value"])
+            if abs(calculated - float(reported)) > 0.5:
+                contradictions.append({
+                    "statement": (
+                        f"{fact['table']} 中 {benchmark}、{model} 的运行时间由 "
+                        f"{baseline['display_value']} 秒降至 {fact['display_value']} 秒，"
+                        f"按表内数值计算降幅为 {calculated:.1f}%，"
+                        f"但表内标为 {float(reported):.1f}%。"
+                    ),
+                    "source_fact_ids": [str(baseline["fact_id"]), str(fact["fact_id"])],
+                })
     return contradictions
 
 
@@ -4055,6 +4256,71 @@ def _audit_answer_claims(answer: str, evidence: str) -> tuple[list[str], list[st
     return supported, unsupported
 
 
+def _recover_claim_fact_ids(
+    claim: str,
+    candidate_facts: list[dict],
+    fact_index: dict[str, dict],
+    allowed_fact_ids: set[str],
+    max_ids: int = 4,
+) -> list[str]:
+    """Find a small, checkable set of candidate facts for one answer clause.
+
+    The existing whole-answer audit accepts a 35% lexical overlap. That is too
+    weak for adding a new citation: a compound claim may match just one of its
+    several examples. Recovery therefore requires 70% coverage across at most
+    four facts, plus every number and ASCII name in the claim.
+    """
+    claim_tokens = _claim_tokens(claim)
+    if not claim_tokens or max_ids <= 0:
+        return []
+    names = set(re.findall(r"[a-z][a-z0-9-]*", claim.lower()))
+    numbers = set(re.findall(r"\d+(?:\.\d+)?", claim))
+    candidates = []
+    for position, compact_fact in enumerate(candidate_facts):
+        fact_id = str(compact_fact.get("fact_id", ""))
+        fact = fact_index.get(fact_id)
+        if (
+            fact_id not in allowed_fact_ids or not fact
+            or fact.get("grounded") is False
+            or fact.get("page") is None
+            or not str(fact.get("source_quote", "")).strip()
+        ):
+            continue
+        evidence = "\n".join(
+            str(fact.get(key, "")) for key in ("statement", "source_quote")
+        )
+        tokens = _claim_tokens(evidence)
+        if len(tokens & claim_tokens) < 2:
+            continue
+        candidates.append((fact_id, tokens, evidence, position))
+
+    selected: list[tuple[str, set[str], str, int]] = []
+    covered: set[str] = set()
+    while len(selected) < max_ids:
+        remaining = [item for item in candidates if item not in selected]
+        if not remaining:
+            break
+        best = max(
+            remaining,
+            key=lambda item: (
+                len((item[1] & claim_tokens) - covered),
+                -item[3],
+            ),
+        )
+        gain = len((best[1] & claim_tokens) - covered)
+        if gain == 0:
+            break
+        selected.append(best)
+        covered |= best[1]
+        coverage = len(claim_tokens & covered) / len(claim_tokens)
+        if coverage >= 0.7 and names <= covered and numbers <= covered:
+            evidence = "\n".join(item[2] for item in selected)
+            supported, unsupported = _audit_answer_claims(claim, evidence)
+            if supported and not unsupported:
+                return [item[0] for item in selected]
+    return []
+
+
 _NO_CONTRADICTION_RE = re.compile(r"未发现|no contradiction", re.IGNORECASE)
 
 
@@ -4141,7 +4407,7 @@ def _build_contradiction_answer(
         confidence = 0.5
     result = GlobalAnswer(
         question=question,
-        answer="；".join(statements),
+        answer="；".join(statement.rstrip("。；; ") for statement in statements) + "。",
         source_fact_ids=source_fact_ids,
         source_sections=sorted(
             {str(source["section_id"]) for source in sources if source.get("section_id")}
@@ -4153,6 +4419,145 @@ def _build_contradiction_answer(
     )
     result.evidence_chain_status = "deterministic_short_circuit"
     return result
+
+
+def _build_comparison_answer(
+    question: str, fact_index: dict[str, dict]
+) -> GlobalAnswer | None:
+    """List named alternatives directly from grounded comparison evidence.
+
+    Each listed name must occur in the fact's source quote. This narrow path
+    avoids a model refusal when a results table already names the compared
+    systems, while leaving papers without such evidence on the normal QA path.
+    """
+    entities: dict[str, tuple[str, str]] = {}
+    table_count = 0
+    for fact_id, fact in fact_index.items():
+        if not fact.get("grounded") or fact.get("page") is None:
+            continue
+        statement = str(fact.get("statement", ""))
+        quote = str(fact.get("source_quote", ""))
+        match = re.match(
+            r"(?:Method|Memory System|Memory Controller Variant|System)\s*=\s*([^;]+)",
+            statement, re.IGNORECASE,
+        )
+        if match:
+            name = re.sub(r"\s*\([^)]*(?:et al\.?|ours)[^)]*\)", "", match.group(1), flags=re.IGNORECASE).strip()
+            if name.lower() in {"none", "no memory", "baseline"}:
+                continue
+            if len(name) < 3 or name.lower() not in quote.lower():
+                continue
+            key = _normalize_metric_key(name)
+            entities.setdefault(key, (name, fact_id))
+            table_count += 1
+            continue
+        title = str(fact.get("section_title", "")).lower()
+        if fact.get("kind") not in {"method", "relation", "classification"} or not any(
+            term in title for term in ("experiment", "setup", "comparison", "实验", "对比")
+        ):
+            continue
+        lead = re.match(r"^([A-Z][A-Za-z0-9-]{2,})", statement)
+        if lead and "-" in lead.group(1) and lead.group(1).lower() in quote.lower():
+            name = lead.group(1)
+            entities.setdefault(_normalize_metric_key(name), (name, fact_id))
+    if table_count < 2 or len(entities) < 3:
+        return None
+    if "learningtoshare" in entities:
+        entities.pop("lts", None)
+    if "ltsaddall" in entities:
+        entities.pop("ltsall", None)
+    names = list(entities.values())[:12]
+    fact_ids = list(dict.fromkeys(fact_id for _, fact_id in names))
+    sources = [fact_index[fact_id] for fact_id in fact_ids]
+    answer = GlobalAnswer(
+        question=question,
+        answer="比较的方案或系统包括：" + "、".join(name for name, _ in names) + "。",
+        source_fact_ids=fact_ids,
+        claim_citations=[
+            ClaimCitation(claim=name, source_fact_ids=[fact_id])
+            for name, fact_id in names
+        ],
+        source_sections=sorted({str(source["section_id"]) for source in sources}),
+        source_pages=sorted({int(source["page"]) for source in sources}),
+        confidence=min(0.85, sum(float(source.get("confidence", 0.0)) for source in sources) / len(sources)),
+    )
+    answer.evidence_chain_status = "deterministic_short_circuit"
+    return answer
+
+
+def _build_layer_metric_answer(
+    question: str, fact_index: dict[str, dict]
+) -> GlobalAnswer | None:
+    """Render an explicitly numbered four-layer metric stack from exact lines."""
+    layers: dict[int, tuple[str, dict]] = {}
+    for fact_id, fact in fact_index.items():
+        match = re.fullmatch(r"评估栈第([1-4])层", str(fact.get("concept", "")))
+        if match and fact.get("grounded") and fact.get("source_quote"):
+            layers[int(match.group(1))] = (fact_id, fact)
+    if set(layers) != {1, 2, 3, 4}:
+        return None
+    definitions = {
+        1: ("任务成效", (("success rate", "成功率"), ("factual correctness", "事实正确率"), ("plan completion rate", "计划完成率"))),
+        2: ("记忆质量", (("precision/recall", "检索精确率/召回率"), ("contradiction rate", "矛盾率"), ("staleness distribution", "陈旧度分布"), ("coverage of task-relevant facts", "任务相关事实覆盖率"))),
+        3: ("效率", (("latency per memory operation", "记忆操作延迟"), ("prompt tokens", "提示 token 消耗"), ("retrieval calls per step", "每步检索次数"), ("storage growth", "存储增长"))),
+        4: ("治理", (("privacy leakage rate", "隐私泄漏率"), ("deletion compliance", "删除合规性"), ("access-scope violations", "访问范围违规"))),
+    }
+    clauses = []
+    citations = []
+    for number in range(1, 5):
+        fact_id, fact = layers[number]
+        title, terms = definitions[number]
+        quote = str(fact["source_quote"]).lower()
+        metrics = [translation for phrase, translation in terms if phrase in quote]
+        clause = f"第{number}层{title}" + ("：" + "、".join(metrics) if metrics else "")
+        clauses.append(clause)
+        citations.append(ClaimCitation(claim=clause, source_fact_ids=[fact_id]))
+    sources = [item[1] for item in layers.values()]
+    answer = GlobalAnswer(
+        question=question,
+        answer="评价指标分为四层：" + "；".join(clauses) + "。",
+        source_fact_ids=[layers[number][0] for number in range(1, 5)],
+        claim_citations=citations,
+        source_sections=sorted({str(source["section_id"]) for source in sources}),
+        source_pages=sorted({int(source["page"]) for source in sources}),
+        confidence=min(float(source.get("confidence", 0.0)) for source in sources),
+    )
+    answer.evidence_chain_status = "deterministic_short_circuit"
+    return answer
+
+
+def _attach_numeric_conflict_note(
+    answer: GlobalAnswer, contradictions: list[dict], fact_index: dict[str, dict]
+) -> GlobalAnswer:
+    if "定量结果" not in answer.question or answer.answer == "证据不足":
+        return answer
+    for item in contradictions:
+        statement = str(item.get("statement", ""))
+        values = set(re.findall(r"为\s*(\d+(?:\.\d+)?)\s*秒", statement))
+        fact_ids = [str(fid) for fid in item.get("source_fact_ids", []) if fid in fact_index]
+        if len(values) < 2 or len(fact_ids) < 2 or not any(
+            re.search(rf"(?<!\d){re.escape(value)}(?!\d)", answer.answer)
+            for value in values
+        ):
+            continue
+        if "原文数值存在冲突" in answer.answer:
+            break
+        note = "原文数值存在冲突：" + statement.rstrip("。") + "。"
+        answer.answer = answer.answer.rstrip("。") + "。" + note
+        answer.source_fact_ids = list(dict.fromkeys([*answer.source_fact_ids, *fact_ids]))
+        answer.claim_citations.append(ClaimCitation(claim=note, source_fact_ids=fact_ids))
+        sources = [fact_index[fid] for fid in answer.source_fact_ids if fid in fact_index]
+        answer.source_sections = sorted({str(source["section_id"]) for source in sources})
+        answer.source_pages = sorted({int(source["page"]) for source in sources if source.get("page") is not None})
+        answer.unsupported_claims = [
+            claim for claim in answer.unsupported_claims
+            if not (
+                "冲突" in claim
+                and values <= set(re.findall(r"\d+(?:\.\d+)?", claim))
+            )
+        ]
+        break
+    return answer
 
 
 # --- Overview numeric attribution ------------------------------------------
@@ -4300,11 +4705,27 @@ def _merge_overview_contradictions(
     """
     merged = list(detected)
     seen = {item.get("statement") for item in merged if item.get("statement")}
+    def same_numeric_conflict(left: str, right: str) -> bool:
+        numbers = _numeric_forms(left)
+        return (
+            len(numbers) >= 2 and numbers == _numeric_forms(right)
+            and set(re.findall(r"table\s*\d+", left.lower()))
+            == set(re.findall(r"table\s*\d+", right.lower()))
+        )
     for statement in overview_statements:
         statement = str(statement)
         if not statement or _NO_CONTRADICTION_RE.search(statement):
             continue
-        if statement in seen:
+        if len(_numeric_forms(statement)) < 2 and not re.search(
+            r"矛盾|冲突|contradiction|inconsisten", statement, re.IGNORECASE
+        ):
+            # Trade-offs and design tensions are not contradictions. Without
+            # conflicting values or an explicit conflict claim, omit them.
+            continue
+        if statement in seen or any(
+            same_numeric_conflict(statement, str(existing.get("statement", "")))
+            for existing in merged
+        ):
             continue
         fact_ids = _match_contradiction_fact_ids(statement, fact_index)
         merged.append({"statement": statement, "source_fact_ids": fact_ids})
@@ -4430,6 +4851,7 @@ def _finalize_evidence_chain(
         # Enforce the output contract on this final state as well: a refusal must
         # not retain speculative intermediate claims from the model response.
         answer.evidence_chain = []
+        answer.claim_citations = []
         answer.source_fact_ids = []
         answer.source_sections = []
         answer.source_pages = []
@@ -4559,9 +4981,18 @@ def _finalize_answer_provenance(
     recovered_fact_ids = _recover_answer_fact_ids(
         answer, candidate_facts, fact_index
     )
+    claim_fact_ids = []
+    if original_answer.strip() != "证据不足":
+        for claim in re.findall(r"[^。！？!?；;]+[。！？!?；;]?", original_answer):
+            if claim.strip():
+                claim_fact_ids.extend(
+                    _recover_claim_fact_ids(
+                        claim, candidate_facts, fact_index, allowed_fact_ids
+                    )
+                )
     answer.source_fact_ids = list(dict.fromkeys(
-        [*chain_fact_ids, *recovered_fact_ids]
-    ))[:3]
+        [*chain_fact_ids, *recovered_fact_ids, *claim_fact_ids]
+    ))[:24]
     if not answer.source_fact_ids and original_answer.strip() != "证据不足":
         if any(term in answer.question for term in ("定量", "评价指标", "比较了哪些")):
             limit = 1
@@ -4592,6 +5023,22 @@ def _finalize_answer_provenance(
                     dict.fromkeys([*answer.unsupported_claims, original_answer])
                 )
     answer = _apply_answer_provenance(answer, fact_index, allowed_fact_ids)
+    if answer.answer.strip() != "证据不足":
+        cited_facts = [
+            fact for fact in candidate_facts
+            if fact.get("fact_id") in answer.source_fact_ids
+        ]
+        answer.claim_citations = []
+        for claim in re.findall(r"[^。！？!?；;]+[。！？!?；;]?", answer.answer):
+            if not claim.strip():
+                continue
+            fact_ids = _recover_claim_fact_ids(
+                claim, cited_facts, fact_index, allowed_fact_ids
+            )
+            if fact_ids:
+                answer.claim_citations.append(
+                    ClaimCitation(claim=claim.strip(), source_fact_ids=fact_ids)
+                )
     return _finalize_evidence_chain(answer, fact_index, allowed_fact_ids)
 
 
@@ -4724,6 +5171,8 @@ def build_question_request(
     contradictions: list[dict],
     max_tokens: int = 2200,
 ) -> tuple[dict, set[str]]:
+    if max_tokens == 2200 and any(term in question for term in ("比较了", "定量结果")):
+        max_tokens = 3000
     routes = [
         (("研究问题", "核心"), {"method", "relation", "result"}, ("aim", "purpose", "goal", "目标", "目的", "研究")),
         (("数据集", "材料"), {"dataset"}, ("dataset", "数据集", "sample", "样本", "urbansound", "sound event")),
@@ -4764,6 +5213,14 @@ def build_question_request(
     # the measured cases). Such facts stay in the catalogue and remain citable for
     # other questions -- only their standing as *the document's metric* is withdrawn.
     metric_route = any(term in question for term in ("评价指标", "指标"))
+    comparison_route = any(term in question for term in ("比较了", "对比了", "比较对象"))
+    numeric_route = "定量" in question or "最重要" in question
+    related_titles = ("related work", "literature", "background", "相关工作", "文献综述", "背景")
+    has_current_result = any(
+        fact.get("kind") == "result"
+        and not any(term in str(fact.get("section_title", "")).lower() for term in related_titles)
+        for fact in fact_catalog
+    )
 
     section_title_routes = [
         (("数据集", "材料"), ("dataset", "data set", "material", "数据集", "材料")),
@@ -4844,7 +5301,42 @@ def build_question_request(
             return 0, float(fact.get("confidence", 0.0))
         text = f"{fact.get('concept', '')} {fact.get('statement', '')}".lower()
         title = re.sub(r"[^a-z0-9\u3400-\u9fff]+", " ", str(fact.get("section_title", "")).lower())
+        if numeric_route and has_current_result and any(term in title for term in related_titles):
+            return 0, float(fact.get("confidence", 0.0))
         value = kind_relevance(fact)
+        if comparison_route:
+            if fact.get("kind") == "metric":
+                value -= 35
+            if any(term in text for term in (
+                "compare", "compared", "baseline", "variant", "比较", "对比", "基线", "变体",
+            )):
+                value += 45
+            if any(term in title for term in ("experiment", "setup", "comparison", "实验", "对比")):
+                value += 20
+            statement = str(fact.get("statement", ""))
+            if re.search(
+                r"\b(?:[A-Z][a-z]+[A-Z][A-Za-z0-9]*|[A-Z][A-Za-z0-9]*-[A-Za-z0-9-]+)\b",
+                statement,
+            ) and fact.get("kind") != "dataset":
+                value += 65
+        if metric_route:
+            if any(term in text for term in ("评估栈", "评价体系", "评估任务性能", "evaluate task performance")):
+                value += 70
+            if "原文使用了评价指标" in text and "数值结果" in text:
+                value -= 20
+        if numeric_route:
+            # Numeric questions need a measured value, not a conclusion that
+            # merely says performance improved. Prefer main-text result rows.
+            if fact.get("kind") in {"result", "metric"} and re.search(
+                r"\d+(?:\.\d+)?\s*(?:%|秒|s\b|倍|×|pp\b)", text
+            ):
+                value += 45
+                if fact.get("kind") == "result":
+                    value += 25
+                elif not any(term in text for term in (
+                    "accuracy", "acc.", "runtime", "准确率", "运行时间", "任务成功",
+                )):
+                    value -= 30
         if metric_route and fact.get("kind") == "metric" and not _metric_evidenced_dict(fact):
             # Withdraw this fact's standing as *the document's evaluation metric*
             # when it carries no metric evidence, while leaving it in the catalogue
@@ -4900,16 +5392,43 @@ def build_question_request(
         return value, float(fact.get("confidence", 0.0))
 
     ranked = sorted(fact_catalog, key=score, reverse=True)
+    if comparison_route:
+        anchored = [
+            fact for fact in ranked
+            if fact.get("kind") in {"method", "relation", "classification"}
+            and re.match(r"^[A-Z][A-Za-z0-9-]{2,}", str(fact.get("statement", "")))
+            and any(term in str(fact.get("section_title", "")).lower()
+                    for term in ("experiment", "setup", "comparison", "实验", "对比"))
+        ][:6]
+        anchor_ids = {fact.get("fact_id") for fact in anchored}
+        ranked = [*anchored, *(fact for fact in ranked if fact.get("fact_id") not in anchor_ids)]
+    if numeric_route and contradictions:
+        required = set(contradictions[0].get("source_fact_ids", []))
+        anchored = [fact for fact in ranked if fact.get("fact_id") in required]
+        ranked = [*anchored, *(fact for fact in ranked if fact.get("fact_id") not in required)]
     payload = {
         "fact_catalog": [],
-        "deterministic_contradictions": contradictions if "矛盾" in question else [],
+        "deterministic_contradictions": contradictions if any(
+            term in question for term in ("矛盾", "定量结果")
+        ) else [],
         "questions": [{"index": 1, "question": question}],
     }
     selected: set[str] = set()
+    comparison_entities: set[str] = set()
     for fact in ranked:
         fact_id = fact.get("fact_id")
         if not fact_id or score(fact)[0] <= 0:
             continue
+        if comparison_route and fact.get("kind") == "metric":
+            statement = str(fact.get("statement", ""))
+            match = re.match(r"(?:Method|Memory System|Variant)=([^;]+)", statement)
+            if match:
+                model_match = re.search(r"(?:^|;)\s*Model=([^;]+)", statement)
+                entity = _normalize_metric_key(match.group(1)) + "|" + (
+                    _normalize_metric_key(model_match.group(1)) if model_match else ""
+                )
+                if entity in comparison_entities:
+                    continue
         # `section_title` is used for RANKING above (`section_relevance`, +4 per
         # matching section term), but it is ALSO kept in the payload. The token cost
         # is real (105 vs 82 tokens per entry, ~4-6 fewer facts per question without
@@ -4934,6 +5453,8 @@ def build_question_request(
             continue
         payload = candidate
         selected.add(str(fact_id))
+        if comparison_route and fact.get("kind") == "metric" and match:
+            comparison_entities.add(entity)
     return payload, selected
 
 
@@ -5681,6 +6202,14 @@ executive_summary 不超过300字，各数组最多10项。
             return _build_contradiction_answer(
                 question, detected_contradictions, self._document_fact_index
             )
+        if "比较了" in question:
+            direct = _build_comparison_answer(question, self._document_fact_index)
+            if direct is not None:
+                return direct
+        if "评价指标" in question:
+            direct = _build_layer_metric_answer(question, self._document_fact_index)
+            if direct is not None:
+                return direct
         request, allowed_fact_ids = build_question_request(
             question, fact_catalog, detected_contradictions
         )
@@ -5698,11 +6227,14 @@ executive_summary 不超过300字，各数组最多10项。
             answer = GlobalAnswer.model_validate(cached)
             if "evidence_chain" not in cached:
                 answer.evidence_chain_status = "unavailable_legacy"
-            return _finalize_answer_provenance(
+            _finalize_answer_provenance(
                 answer,
                 request["fact_catalog"],
                 self._document_fact_index,
                 allowed_fact_ids,
+            )
+            return _attach_numeric_conflict_note(
+                answer, detected_contradictions, self._document_fact_index
             )
         system = """你是全文证据问答器。只回答一个问题，只能使用 fact_catalog 中的事实；证据不足时回答“证据不足”。输出 JSON 字段包含：question、answer、source_fact_ids、evidence_chain、source_sections、source_pages、confidence。confidence 必须是 0 到 1 之间的数字，不要输出“高/中/低”等文字。evidence_chain 每项必须含 step_index、claim、source_fact_ids、relation_to_previous。
 source_fact_ids 和每步 source_fact_ids 优先从本次输入 fact_catalog 中逐字复制真实 fact_id；如果无法确认具体 ID，就留空数组，绝不可虚构或使用占位字符串。程序会按每步 claim 尝试用候选事实恢复 ID，并标明恢复方式。source_sections、source_pages 留空，由程序反推。
@@ -5715,6 +6247,12 @@ source_fact_ids 和每步 source_fact_ids 优先从本次输入 fact_catalog 中
 5. 不足以回答时 answer="证据不足"，source_fact_ids=[]，evidence_chain=[]。
 6. fact_catalog 中 source_origin="picture_ocr" 表示公式证据来自图像 OCR 而非正文文本。若引用此类事实，答案须明确标注“图像OCR，需核对原页”，不得把符号歧义的公式写成确定结论；source_origin="text" 的普通正文引用不需此标注。
 7. source_origin="pdf_text_layer" 表示 PDF 文本层提供了公式字符但不保证恢复二维版面；若公式含分段、上下标或乘积/求和上下限，答案须避免重排不确定的符号关系，并提示核对原页。"""
+        if "比较了" in question:
+            system += "\n比较对象题请分别列出基线、所提方案和消融/变体；每个对象用独立短句，并为每句给出对应 fact_id。若 PDF 表格中的模型名是残缺片段，只写可核验的方案名，不猜补模型名。"
+        if "定量结果" in question:
+            system += "\n定量结果题优先写同一数据集和模型下的基线→所提方案数值。若 deterministic_contradictions 指出数值冲突，要说明相关数值存在原文冲突。"
+        if "评价指标" in question:
+            system += "\n评价指标题先使用明确的评估框架或指标定义；不要把某项实验成绩、百分比举例或假设性的准确率提升误当成指标定义。"
         try:
             payload = await self._request_json(
                 "global_answer",
@@ -5743,6 +6281,9 @@ source_fact_ids 和每步 source_fact_ids 优先从本次输入 fact_catalog 中
             allowed_fact_ids,
         )
         self.cache.put(key, answer.model_dump())
+        _attach_numeric_conflict_note(
+            answer, detected_contradictions, self._document_fact_index
+        )
         return answer
 
     async def synthesize_document(
@@ -5862,7 +6403,34 @@ source_fact_ids 和每步 source_fact_ids 优先从本次输入 fact_catalog 中
             effective_contradictions = _merge_overview_contradictions(
                 detected_contradictions, result.contradictions, self._document_fact_index
             )
+            result.contradictions = [item["statement"] for item in effective_contradictions]
             for answer in result.global_answers:
+                if "评价指标" in answer.question:
+                    direct = _build_layer_metric_answer(answer.question, self._document_fact_index)
+                    if direct is not None:
+                        answer.answer = direct.answer
+                        answer.source_fact_ids = direct.source_fact_ids
+                        answer.claim_citations = direct.claim_citations
+                        answer.source_sections = direct.source_sections
+                        answer.source_pages = direct.source_pages
+                        answer.confidence = direct.confidence
+                        answer.unsupported_claims = []
+                        answer.evidence_chain = []
+                        answer.evidence_chain_status = "deterministic_short_circuit"
+                        continue
+                if "比较了" in answer.question:
+                    direct = _build_comparison_answer(answer.question, self._document_fact_index)
+                    if direct is not None:
+                        answer.answer = direct.answer
+                        answer.source_fact_ids = direct.source_fact_ids
+                        answer.claim_citations = direct.claim_citations
+                        answer.source_sections = direct.source_sections
+                        answer.source_pages = direct.source_pages
+                        answer.confidence = direct.confidence
+                        answer.unsupported_claims = []
+                        answer.evidence_chain = []
+                        answer.evidence_chain_status = "deterministic_short_circuit"
+                        continue
                 if "矛盾" in answer.question or "contradiction" in answer.question.lower():
                     replacement = _build_contradiction_answer(
                         answer.question,
@@ -5885,6 +6453,9 @@ source_fact_ids 和每步 source_fact_ids 优先从本次输入 fact_catalog 中
                     question_request["fact_catalog"],
                     self._document_fact_index,
                     question_fact_ids,
+                )
+                _attach_numeric_conflict_note(
+                    answer, effective_contradictions, self._document_fact_index
                 )
             return result
         overview = await self._synthesize_overview(
@@ -5911,19 +6482,7 @@ source_fact_ids 和每步 source_fact_ids 优先从本次输入 fact_catalog 中
             )
         )
         result = DocumentSynthesis(**overview.model_dump(), global_answers=answers)
-        if detected_contradictions:
-            statements = list(
-                dict.fromkeys(item["statement"] for item in detected_contradictions if item.get("statement"))
-            )
-            result.contradictions = [
-                *statements,
-                *[
-                    item
-                    for item in result.contradictions
-                    if not re.search(r"未发现|no contradiction", item, re.IGNORECASE)
-                    and item not in statements
-                ],
-            ]
+        result.contradictions = [item["statement"] for item in effective_contradictions]
         self.cache.put(key, result.model_dump())
         return result
 

@@ -38,6 +38,9 @@ from p2g_v2 import (  # noqa: E402
     _apply_group_provenance,
     _audit_answer_claims,
     _build_contradiction_answer,
+    _build_comparison_answer,
+    _build_layer_metric_answer,
+    _attach_numeric_conflict_note,
     _finalize_answer_provenance,
     _match_contradiction_fact_ids,
     _merge_overview_contradictions,
@@ -46,6 +49,7 @@ from p2g_v2 import (  # noqa: E402
     _repair_header_name,
     _row_is_config_row,
     _recover_answer_fact_ids,
+    _recover_claim_fact_ids,
     _strip_english_leak,
     _table_rows,
     build_heading_tree,
@@ -316,6 +320,19 @@ class MetricFactExtractionTests(unittest.TestCase):
         )
 
         self.assertIn(metric_evidence[0]["fact_id"], allowed)
+
+    def test_multiline_evaluation_stack_keeps_each_layer_grounded(self):
+        section = self._section(
+            "We propose a four-layer evaluation stack:\n"
+            "**Layer 1—Task effectiveness:** success rate, factual correctness.\n"
+            "**Layer 2—Memory quality:** retrieved-record precision/recall.\n"
+            "**Layer 3—Efficiency:** latency and prompt tokens.\n"
+            "**Layer 4—Governance:** privacy leakage and deletion compliance."
+        )
+        facts = extract_metric_facts(section)
+        layers = [fact for fact in facts if fact.concept.startswith("评估栈第")]
+        self.assertEqual(len(layers), 4)
+        self.assertTrue(all(fact.grounded and fact.source_quote for fact in layers))
 
 
 class MetricEvidenceTests(unittest.TestCase):
@@ -2585,6 +2602,80 @@ class UtilityTests(unittest.TestCase):
 
         self.assertEqual(recovered, ["fact-current"])
 
+    def test_each_answer_clause_can_recover_its_own_citation(self):
+        clauses = [
+            "压缩会丢失低频细节；",
+            "固定摘要不关心材料的重要性；",
+            "长期训练需要高昂成本；",
+            "学习遗忘可能删除安全信息。",
+        ]
+        candidates = [
+            {"fact_id": f"fact-{index}", "statement": clause}
+            for index, clause in enumerate(clauses)
+        ]
+        index = {
+            fact["fact_id"]: {
+                **fact,
+                "source_quote": fact["statement"],
+                "section_id": "limitations",
+                "page": position + 1,
+                "confidence": 0.9,
+                "grounded": True,
+            }
+            for position, fact in enumerate(candidates)
+        }
+        answer = GlobalAnswer(
+            question="文档有哪些局限？",
+            answer="".join(clauses),
+            source_fact_ids=["fact-0"],
+            source_sections=[],
+            source_pages=[],
+            confidence=0.9,
+        )
+
+        result = _finalize_answer_provenance(
+            answer, candidates, index, set(index)
+        )
+
+        self.assertEqual(result.answer, "".join(clauses))
+        self.assertEqual(set(result.source_fact_ids), set(index))
+        self.assertEqual(len(result.claim_citations), 4)
+        self.assertEqual(
+            [citation.source_fact_ids for citation in result.claim_citations],
+            [[f"fact-{index}"] for index in range(4)],
+        )
+
+    def test_claim_recovery_requires_all_names_and_numbers(self):
+        claim = "AgeMem采用强化学习，而MemLLM训练了3轮。"
+        candidates = [
+            {"fact_id": "age", "statement": "AgeMem采用强化学习。"},
+            {"fact_id": "mem", "statement": "MemLLM训练了3轮。"},
+        ]
+        index = {
+            fact["fact_id"]: {
+                **fact,
+                "source_quote": fact["statement"],
+                "page": 2,
+                "grounded": True,
+            }
+            for fact in candidates
+        }
+
+        self.assertEqual(
+            set(_recover_claim_fact_ids(claim, candidates, index, set(index))),
+            {"age", "mem"},
+        )
+        self.assertEqual(
+            _recover_claim_fact_ids(claim, candidates, index, {"age"}), []
+        )
+        self.assertEqual(
+            _recover_claim_fact_ids(
+                "AgeMem采用强化学习，而MemLLM训练了9轮。",
+                candidates, index, set(index),
+            ),
+            [],
+        )
+
     def test_answer_fact_id_recovery_rejects_mismatched_numbers(self):
         answer = GlobalAnswer(
             question="最重要的定量结果是什么？",
@@ -3345,6 +3436,147 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0][0], "Anthropomorphism")
         self.assertEqual(len(source_rows), 2)
+
+    def test_split_benchmark_headers_and_runtime_annotations(self):
+        markdown = (
+            "Table 1. Results on AssistantBench and GAIA.\n"
+            "|Method|Model|Assis Acc.|tantBench Runtime|G Acc.|AIA Runtime|\n"
+            "|---|---|---|---|---|---|\n"
+            "|M1-Parallel|GPT-5.1|24.0|1389s|47.9|1005s|\n"
+            "|LTS (Ours)|GPT-5.1|26.7|882s ↓44.6%|49.1|781s ↓25.1%|\n"
+        )
+        section = flatten_sections(build_heading_tree(
+            [PageMarkdown(page=7, text="# 4 Results\n" + markdown)]
+        ))[0]
+        facts = extract_table_facts(section)
+        runtime = [f for f in facts if f.metric == "GAIA Runtime" and f.display_value == "781"]
+        self.assertEqual(len(runtime), 1)
+        self.assertEqual(runtime[0].unit, "s")
+        self.assertEqual(runtime[0].reported_change_pct, 25.1)
+        self.assertTrue(any(f.metric == "AssistantBench Runtime" for f in facts))
+
+    def test_cross_table_runtime_and_reported_reduction_conflicts(self):
+        first = flatten_sections(build_heading_tree([PageMarkdown(page=7, text=(
+            "# 4 Results\nTable 1. Results on AssistantBench and GAIA.\n"
+            "|Method|Model|Assis Acc.|tantBench Runtime|G Acc.|AIA Runtime|\n"
+            "|---|---|---|---|---|---|\n"
+            "|M1-Parallel|GPT-5.1|24.0|1389s|47.9|1005s|\n"
+            "|LTS (Ours)|GPT-5.1|26.7|882s ↓44.6%|49.1|781s ↓25.1%|\n"
+        ))]))[0]
+        second = flatten_sections(build_heading_tree([PageMarkdown(page=8, text=(
+            "# 5 Ablation\nTable 2. Runtime comparison (GPT-5.1).\n"
+            "|Memory System|GAIA Runtime|\n|---|---|\n|LTS (Ours)|792s|\n"
+        ))]))[0]
+        sections = [
+            {"table_facts": [f.model_dump() for f in extract_table_facts(node)]}
+            for node in (first, second)
+        ]
+        findings = detect_document_contradictions(sections)
+        joined = "\n".join(item["statement"] for item in findings)
+        self.assertIn("781 秒", joined)
+        self.assertIn("792 秒", joined)
+        self.assertIn("36.5%", joined)
+        self.assertIn("22.3%", joined)
+
+    def test_comparison_request_keeps_named_variants_ahead_of_generic_method(self):
+        facts = [
+            {"fact_id": "generic", "kind": "method", "concept": "baseline",
+             "statement": "绝对奖励采用组相对基线归一化。", "section_title": "3 Method"},
+            {"fact_id": "variant", "kind": "method", "concept": "LTS-AddAll",
+             "statement": "LTS-AddAll 将所有步骤写入共享记忆。", "section_title": "4 Experimental Setup"},
+            {"fact_id": "baseline", "kind": "relation", "concept": "M1-Parallel",
+             "statement": "M1-Parallel 是无记忆的并行基线。", "section_title": "4 Experimental Setup"},
+        ]
+        payload, selected = build_question_request(
+            "比较了哪些模型、方案或对象？", facts, [], max_tokens=600
+        )
+        self.assertIn("variant", selected)
+        self.assertIn("baseline", selected)
+        self.assertNotEqual(payload["fact_catalog"][0]["fact_id"], "generic")
+
+    def test_metric_request_prefers_evaluation_framework_over_incidental_number(self):
+        facts = [
+            {"fact_id": "incidental", "kind": "metric", "concept": "accuracy",
+             "statement": "原文使用了评价指标 accuracy，并把数值结果记为 5%。",
+             "section_title": "5 Evaluation"},
+            {"fact_id": "framework", "kind": "method", "concept": "评价体系",
+             "statement": "作者提出四层评估栈：任务成效、记忆质量、效率与治理。",
+             "section_title": "5 Evaluation"},
+        ]
+        payload, _ = build_question_request("使用了哪些评价指标？", facts, [], max_tokens=600)
+        self.assertEqual(payload["fact_catalog"][0]["fact_id"], "framework")
+
+    def test_overview_numeric_conflict_dedupes_same_values_and_tables(self):
+        detected = [{
+            "statement": "GAIA 在 Table 1 为 781 秒，在 Table 2 为 792 秒。",
+            "source_fact_ids": ["left", "right"],
+        }]
+        overview = ["gaia 在 Table 1 为 781 秒，在 Table 2 为 792 秒"]
+        merged = _merge_overview_contradictions(detected, overview, {})
+        self.assertEqual(len(merged), 1)
+
+    def test_overview_tradeoff_is_not_a_contradiction(self):
+        merged = _merge_overview_contradictions(
+            [], ["效用与效率之间存在设计张力。"], {}
+        )
+        self.assertEqual(merged, [])
+
+    def test_comparison_answer_uses_only_names_present_in_source_rows(self):
+        index = {
+            name: {
+                "section_id": "s1", "section_title": "4 Experimental Setup",
+                "page": 6, "kind": "metric", "grounded": True,
+                "confidence": 1.0,
+                "statement": f"Method={name}; Accuracy=25.0%",
+                "source_quote": f"|{name}|25.0|",
+            }
+            for name in ("MagenticOne", "M1-Parallel", "Learning to Share")
+        }
+        answer = _build_comparison_answer("比较了哪些模型、方案或对象？", index)
+        self.assertIsNotNone(answer)
+        self.assertIn("MagenticOne", answer.answer)
+        self.assertIn("M1-Parallel", answer.answer)
+        self.assertEqual(len(answer.claim_citations), 3)
+
+    def test_numeric_answer_preserves_verified_table_conflict(self):
+        answer = GlobalAnswer(
+            question="最重要的定量结果是什么？", answer="GAIA 运行时间为 792 秒。",
+            source_fact_ids=["right"], source_sections=["s2"],
+            source_pages=[7], confidence=0.9,
+        )
+        facts = {
+            "left": {"section_id": "s1", "page": 7},
+            "right": {"section_id": "s2", "page": 7},
+        }
+        conflicts = [{
+            "statement": "Table 1 为 781 秒，Table 2 为 792 秒。",
+            "source_fact_ids": ["left", "right"],
+        }]
+        _attach_numeric_conflict_note(answer, conflicts, facts)
+        self.assertIn("781 秒", answer.answer)
+        self.assertEqual(set(answer.source_fact_ids), {"left", "right"})
+        self.assertEqual(len(answer.claim_citations), 1)
+
+    def test_four_layer_metric_answer_uses_exact_source_lines(self):
+        lines = [
+            "Layer 1—Task effectiveness: success rate, factual correctness.",
+            "Layer 2—Memory quality: precision/recall, contradiction rate.",
+            "Layer 3—Efficiency: latency per memory operation, prompt tokens.",
+            "Layer 4—Governance: privacy leakage rate, deletion compliance.",
+        ]
+        index = {
+            str(number): {
+                "concept": f"评估栈第{number}层", "source_quote": line,
+                "grounded": True, "section_id": "s1", "page": 7,
+                "confidence": 0.9,
+            }
+            for number, line in enumerate(lines, 1)
+        }
+        answer = _build_layer_metric_answer("使用了哪些评价指标？", index)
+        self.assertIsNotNone(answer)
+        self.assertIn("成功率", answer.answer)
+        self.assertIn("隐私泄漏率", answer.answer)
+        self.assertEqual(len(answer.claim_citations), 4)
 
     def test_document_contradiction_flags_cross_page_same_cell(self):
         # Same metric + row context, SAME table caption, different pages,
